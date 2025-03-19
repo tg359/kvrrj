@@ -16,4 +16,11 @@
     "python.testing.cwd": "${workspaceFolder}/tests",
     "python.testing.pytestPath": "${workspaceFolder}/.venv/bin/pytest",
     "python.testing.autoTestDiscoverOnSaveEnabled": true,
+    "python.analysis.typeCheckingMode": "standard",
+    "python.analysis.autoImportCompletions": true,
+    // editor settings
+    "files.exclude": {
+        "**/__pycache__": true,
+        "**/.pytest_cache": true
+    }
 }
