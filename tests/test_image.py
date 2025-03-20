@@ -81,7 +81,7 @@ def test_tile_images():
 
     # Test non-PIL image input
     with pytest.raises(TypeError, match="must be PIL Image"):
-        tile_images([img1, "not_an_image", img3, img4], rows=2, cols=2)
+        tile_images([img1, "not_an_image", img3, img4], rows=2, cols=2)  # type: ignore
 
     # Test mismatched image dimensions
     img5 = Image.new("RGBA", (50, 50), color="purple")

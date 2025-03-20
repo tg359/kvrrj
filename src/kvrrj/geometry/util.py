@@ -292,7 +292,7 @@ def point_group(points: list[list[float]], threshold: float) -> list[list[float]
         raise ValueError("Only 2D or 3D points are supported.")
 
     if len(points) == 1:
-        return [points]
+        return [points]  # type: ignore
 
     if threshold == 0:
         # return original points

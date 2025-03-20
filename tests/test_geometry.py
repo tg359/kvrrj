@@ -1,7 +1,8 @@
 import numpy as np
 import pytest
 
-from kvrrj.geometry import (
+from kvrrj.geometry.icosphere import Mesh3D, create_icosphere
+from kvrrj.geometry.util import (
     angle_clockwise_from_north,
     angle_from_cardinal,
     angle_to_vector,
@@ -191,3 +192,24 @@ def test_point_group():
     clusters = point_group(points, threshold)
     assert len(clusters) == 3
     assert clusters[1] == [[5, 5, 5], [4.5, 5.5, 6]]
+
+
+def test_create_icosphere():
+    sphere = create_icosphere(resolution=1)
+    assert isinstance(sphere, Mesh3D)
+    assert len(sphere.vertices) == 42
+    assert len(sphere.faces) == 80
+
+    sphere = create_icosphere(resolution=4)
+    assert isinstance(sphere, Mesh3D)
+    assert len(sphere.vertices) == 2562
+    assert len(sphere.faces) == 5120
+
+    with pytest.raises(ValueError):
+        create_icosphere(resolution=-1)
+
+    with pytest.raises(ValueError):
+        create_icosphere(resolution=0)
+
+    with pytest.raises(ValueError):
+        create_icosphere(resolution=2.5)

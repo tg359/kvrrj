@@ -7,7 +7,7 @@ import numpy as np
 from matplotlib.figure import Figure
 from PIL import Image
 
-from kvrrj.geometry import point_group
+from kvrrj.geometry.util import point_group
 from kvrrj.viz.color import to_rgba
 
 

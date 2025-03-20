@@ -75,7 +75,7 @@ Remove-Item $LBT_REQUIREMENTS_TXT
 uv add --dev pytest pytest-cov pylint ipykernel Sphinx sphinx_bootstrap_theme sphinxcontrib-fulltoc sphinxcontrib-napoleon
 
 # add other dependencies
-uv add case-converter dash dask dask[distributed] geopandas[all] meteostat openpyxl plotly pyarrow pyet scikit-learn scipy tables tqdm xlrd
+uv add case-converter dash dask dask[distributed] geopandas[all] meteostat openpyxl plotly pyarrow pyet pyvista[all] scikit-learn scipy shapely tables tqdm xlrd
 
 # create a vscode directory
 $VSCODE_DIR = "$TARGET_DIR\.vscode"
@@ -96,7 +96,7 @@ if (!(Test-Path $TEST_DIR)) {
 }
 # add a test file
 New-Item -ItemType File -Path "$TEST_DIR\test_main.py"
-# add following text to the test file
+# add following text to the test filepython
 Set-Content -Path "$TEST_DIR\test_main.py" -Value "from $PACKAGE_NAME import main`r`n`r`n`r`ndef test_main():`r`n    main()`r`n"
 
 # append the following to the pyproject.toml file
@@ -107,6 +107,16 @@ Set-Content -Path $PYPROJECT_TOML -Value $PYPROJECT_TOML_CONTENT
 
 # add venv to jupyter
 uv run ipython kernel install --user --name=$PACKAGE_NAME --env VIRTUAL_ENV "$TARGET_DIR\.venv"
+
+# clone pymesh repo
+git clone https://github.com/PyMesh/PyMesh.git
+Set-Location "$TARGET_DIR\PyMesh"
+# clone dependencies
+git submodule update --init
+$env:PYMESH_PATH = Get-Location
+# build with setuptools
+uv pip install -e .
+Set-Location $TARGET_DIR
 
 # run jupyter
 # uv tool run jupyter lab

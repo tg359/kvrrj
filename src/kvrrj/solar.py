@@ -11,7 +11,7 @@ from ladybug_geometry.geometry2d import Vector2D
 from ladybug_radiance.skymatrix import SkyMatrix
 from ladybug_radiance.visualize.radrose import RadiationRose
 
-from .geometry import angle_clockwise_from_north
+from .geometry.util import angle_clockwise_from_north
 from .ladybug.analysis_period import (
     analysis_period_to_datetimes,
     lbdatetime_from_datetime,
