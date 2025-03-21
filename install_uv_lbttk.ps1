@@ -7,7 +7,7 @@
 # TODO - rename the repo to the resultant name
 $REPO_NAME = "kvrrj"
 $REPO_URL = "https://github.com/tg359/$REPO_NAME/archive/refs/heads/main.zip"
-$TARGET_DIR = "$env:USERPROFILE\Documents\GitHub"
+$TARGET_DIR = "$env:USERPROFILE\Documents\GitHub\$REPO_NAME"
 $PROGRAMFILES = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::ProgramFiles)
 $POLLINATION_UNINSTALLER_EXE = "$PROGRAMFILES\pollination\uninstall.exe"
 $EXPECTED_POLLINATION_VERSION = "1.50.1.0"
@@ -18,7 +18,7 @@ $EXPECTED_POLLINATION_PYTHON_VERSION = "3.10"
 Set-Location $env:USERPROFILE
 
 # failsafe to ensure the target directory is in a sensible location, and not Win32 or similar
-if ($TARGET_DIR -ne "$env:USERPROFILE\Documents\GitHub") {
+if ($TARGET_DIR -ne "$env:USERPROFILE\Documents\GitHub\$REPO_NAME") {
     Write-Host "- Target directory is in a potentially dangerous location ($TARGET_DIR)." -ForegroundColor Red
     exit
 }
@@ -27,9 +27,6 @@ if ($TARGET_DIR -ne "$env:USERPROFILE\Documents\GitHub") {
 if (!(Test-Path $TARGET_DIR)) {
     Write-Host "- Creating target directory $TARGET_DIR" -ForegroundColor Blue
     $null = New-Item -ItemType Directory -Path $TARGET_DIR  # assign to null to suppress output
-} else {
-    Write-Host "- Target directory $TARGET_DIR already exists, removing existing files" -ForegroundColor Yellow
-    Get-ChildItem -Path $TARGET_DIR | Remove-Item -Recurse -Force
 }
 
 # install UV gobally
