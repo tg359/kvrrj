@@ -209,3 +209,13 @@ catch {
     Write-Host "- Failed to copy files from $ASSETS_DIR to $KERNEL_DIR" -ForegroundColor Red
     exit
 }
+
+# attempt to load code in VSCode
+try {
+    code "$TARGET_DIR\$REPO_NAME"
+}
+catch {
+    Write-Host "- Failed to load code using VSCode" -ForegroundColor Red
+    exit
+}
+
