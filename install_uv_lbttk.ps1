@@ -2,6 +2,8 @@
 # It then downloads the code from a Github repository and checks that the dependencies in the requirements.txt file match the dependencies in the pyproject.toml file.
 # It then uses UV to create a venv for the repository.
 
+# to remove UV for an ultra-clean install, follow the steps here - https://docs.astral.sh/uv/getting-started/installation/#uninstallation
+
 # TODO - rename the repo to the resultant name
 $REPO_NAME = "kvrrj"
 $REPO_URL = "https://github.com/tg359/$REPO_NAME/archive/refs/heads/main.zip"
