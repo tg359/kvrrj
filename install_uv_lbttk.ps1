@@ -7,7 +7,7 @@
 # TODO - rename the repo to the resultant name
 $REPO_NAME = "kvrrj"
 $REPO_URL = "https://github.com/tg359/$REPO_NAME/archive/refs/heads/main.zip"
-$TARGET_DIR = "$env:USERPROFILE\Documents\GitHub\target_dir"
+$TARGET_DIR = "$env:USERPROFILE\Documents\GitHub"
 $PROGRAMFILES = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::ProgramFiles)
 $POLLINATION_UNINSTALLER_EXE = "$PROGRAMFILES\pollination\uninstall.exe"
 $EXPECTED_POLLINATION_VERSION = "1.50.1.0"
@@ -18,8 +18,8 @@ $EXPECTED_POLLINATION_PYTHON_VERSION = "3.10"
 Set-Location $env:USERPROFILE
 
 # failsafe to ensure the target directory is in a sensible location, and not Win32 or similar
-if ($TARGET_DIR -ne "$env:USERPROFILE\Documents\GitHub\target_dir") {
-    Write-Host "- Target directory is in a bad location ($TARGET_DIR)." -ForegroundColor Red
+if ($TARGET_DIR -ne "$env:USERPROFILE\Documents\GitHub") {
+    Write-Host "- Target directory is in a potentially dangerous location ($TARGET_DIR)." -ForegroundColor Red
     exit
 }
 
