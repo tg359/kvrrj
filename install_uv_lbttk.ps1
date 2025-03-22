@@ -83,8 +83,8 @@ if (!(Test-Path $POLLINATION_UNINSTALLER_EXE)) {
 # check that the installed version of Pollination matches the expected version
 Write-Host "- Checking Pollination version is $EXPECTED_POLLINATION_VERSION" -ForegroundColor Blue
 $INSTALLED_POLLINATION_VERSION = (get-item $POLLINATION_UNINSTALLER_EXE).VersionInfo | ForEach-Object {("{0}.{1}.{2}.{3}" -f $_.ProductMajorPart,$_.ProductMinorPart,$_.ProductBuildPart,$_.ProductPrivatePart)}
-if ($INSTALLED_POLLINATION_VERSION -ne $TARGET_POLLINATION_VERSION) {
-    Write-Host "- Pollination version ($INSTALLED_POLLINATION_VERSION) is not $TARGET_POLLINATION_VERSION." -ForegroundColor Red
+if ($INSTALLED_POLLINATION_VERSION -ne $EXPECTED_POLLINATION_VERSION) {
+    Write-Host "- Pollination version ($INSTALLED_POLLINATION_VERSION) is not $EXPECTED_POLLINATION_VERSION." -ForegroundColor Red
     exit
 } else {
     Write-Host "- Pollination version is $EXPECTED_POLLINATION_VERSION" -ForegroundColor Green
