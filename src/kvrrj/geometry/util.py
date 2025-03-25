@@ -5,7 +5,43 @@ from collections import defaultdict
 from typing import Sequence
 
 import numpy as np
+from ladybug.location import Location
 from sklearn.neighbors import KDTree
+
+
+def great_circle_distance(location1: Location, location2: Location) -> float:
+    """
+    Calculate the great circle distance between two points on the earth
+    (specified in decimal degrees), in metres.
+
+    Args:
+        location1 (Location):
+            Location object of the first location
+        location2 (Location):
+            Location object of the second location
+
+    Returns:
+        distance (float):
+            The distance between the two locations in m
+    """
+    r = 6373.0  # approximate radius of earth in km
+    lat1 = np.radians(location1.latitude)
+    lon1 = np.radians(location1.longitude)
+    lat2 = np.radians(location2.latitude)
+    lon2 = np.radians(location2.longitude)
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    distance = r * c
+    return distance * 1000
+
+
+def haversine(location1: Location, location2: Location) -> float:
+    """
+    Proxy for accessing the great circle distance between two locations.
+    """
+    return great_circle_distance(location1, location2)
 
 
 def cardinality(direction_angle: int | float, directions: int = 16):

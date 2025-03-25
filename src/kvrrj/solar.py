@@ -1,21 +1,30 @@
 """Methods for handling sun location/position data."""
 
+import pickle
 from datetime import date, datetime
 from enum import Enum, auto
+from pathlib import Path
 
+import numpy as np
 import pandas as pd
+from honeybee.config import folders as hb_folders
 from ladybug.analysisperiod import AnalysisPeriod
 from ladybug.epw import EPW
 from ladybug.sunpath import Location, Sunpath
 from ladybug_geometry.geometry2d import Vector2D
 from ladybug_radiance.skymatrix import SkyMatrix
 from ladybug_radiance.visualize.radrose import RadiationRose
+from tqdm import tqdm
 
 from .geometry.util import angle_clockwise_from_north
 from .ladybug.analysis_period import (
     analysis_period_to_datetimes,
     lbdatetime_from_datetime,
 )
+
+# TODO - make this an object, similar to the Wind class
+# class Solar:
+#     """A class for handling solar data."""
 
 
 class _SunriseType(Enum):
@@ -125,7 +134,6 @@ class IrradianceType(Enum):
     TOTAL = auto()
     DIRECT = auto()
     DIFFUSE = auto()
-    REFLECTED = auto()
 
     def to_string(self) -> str:
         """Get the string representation of the IrradianceType."""
@@ -134,7 +142,6 @@ class IrradianceType(Enum):
 
 def azimuthal_radiation(
     epw: EPW,
-    rad_type: IrradianceType = IrradianceType.TOTAL,
     analysis_period: AnalysisPeriod = AnalysisPeriod(),
     tilt_angle: float = 0,
     directions: int = 36,
@@ -145,9 +152,6 @@ def azimuthal_radiation(
     Args:
         epw (EPW):
             The EPW representing the weather data/location to be visualised.
-        rad_type (IrradianceType, optional):
-            The type of radiation to plot.
-            Defaults to IrradianceType.TOTAL.
         analysis_period (AnalysisPeriod, optional):
             The analysis period over which radiation shall be summarised.
             Defaults to AnalysisPeriod().
@@ -185,8 +189,100 @@ def azimuthal_radiation(
         for j in [Vector2D(*i[:2]) for i in rr.direction_vectors]
     ]
 
-    values = getattr(rr, f"{rad_type.name.lower()}_values")
+    total_values = getattr(rr, "total_values")
+    direct_values = getattr(rr, "direct_values")
+    diffuse_values = getattr(rr, "diffuse_values")
 
-    return pd.Series(
-        values, index=angles, name=f"{rad_type.to_string()} for tilt {tilt_angle}°"
+    return pd.concat(
+        [
+            pd.Series(
+                total_values, index=angles, name=IrradianceType.TOTAL.to_string()
+            ),
+            pd.Series(
+                direct_values, index=angles, name=IrradianceType.DIRECT.to_string()
+            ),
+            pd.Series(
+                diffuse_values, index=angles, name=IrradianceType.DIFFUSE.to_string()
+            ),
+        ],
+        axis=1,
     )
+
+
+def tilt_orientation_factor(
+    epw: EPW,
+    analysis_period: AnalysisPeriod = AnalysisPeriod(),
+    directions: int = 36,
+    tilts: int = 9,
+) -> pd.DataFrame:
+    """Create a tilt-orientation factor matrix.
+
+    Args:
+        epw_file (Path):
+            The EPW file representing the weather data/location to be calculated.
+        analysis_period (AnalysisPeriod, optional):
+            The analysis period over which radiation shall be summarised.
+            Defaults to AnalysisPeriod().
+        directions (int, optional):
+            The number of directions to bin data into.
+            Defaults to 36.
+        tilts (int, optional):
+            The number of tilts to calculate.
+            Defaults to 9.
+
+    Returns:
+        pd.DataFrame:
+            A DataFrame with tilt-orientation factors.
+    """
+
+    # create dir for cached results
+    _dir = Path(hb_folders.default_simulation_folder) / "_lbt_tk_solar"
+    _dir.mkdir(exist_ok=True, parents=True)
+    ndir = directions
+
+    # create sky matrix
+    smx = SkyMatrix.from_epw(
+        epw_file=epw.file_path, high_density=True, hoys=analysis_period.hoys
+    )
+
+    # create roses per tilt angle
+    _directions = np.linspace(0, 360, directions + 1)[:-1].tolist()
+    _tilts = np.linspace(0, 90, tilts)[:-1].tolist() + [89.999]
+    rrs: list[RadiationRose] = []
+    for ta in tqdm(_tilts):
+        sp = _dir / f"{Path(epw.file_path).stem}_{ndir}_{ta:0.4f}.pickle"
+        if sp.exists():
+            rr = pickle.load(open(sp, "rb"))
+        else:
+            rr = RadiationRose(
+                sky_matrix=smx, direction_count=directions, tilt_angle=ta
+            )
+            pickle.dump(rr, open(sp, "wb"))
+        rrs.append(rr)
+    _directions.append(360)
+
+    # create matrices of values from results
+    total_values = np.array([i.total_values for i in rrs]).T
+    total_values = np.concatenate([total_values, total_values[[0], :]], axis=0)
+
+    direct_values = np.array([i.direct_values for i in rrs]).T
+    direct_values = np.concatenate([direct_values, direct_values[[0], :]], axis=0)
+
+    diffuse_values = np.array([i.diffuse_values for i in rrs]).T
+    diffuse_values = np.concatenate([diffuse_values, diffuse_values[[0], :]], axis=0)
+
+    # create dataframe
+    df = pd.concat(
+        [
+            pd.DataFrame(data=total_values, index=_directions, columns=_tilts),
+            pd.DataFrame(data=direct_values, index=_directions, columns=_tilts),
+            pd.DataFrame(data=diffuse_values, index=_directions, columns=_tilts),
+        ],
+        axis=1,
+        keys=[
+            IrradianceType.TOTAL.to_string(),
+            IrradianceType.DIRECT.to_string(),
+            IrradianceType.DIFFUSE.to_string(),
+        ],
+    )
+    return df

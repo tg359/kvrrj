@@ -192,7 +192,6 @@ def test_average_color():
 
 
 def test_colormap_sequential():
-    """_"""
     assert sum(colormap_sequential("red", "green", "blue")(0.25)) == pytest.approx(
         1.750003844675125, rel=0.01
     )

@@ -3,13 +3,72 @@ import pytest
 
 from kvrrj.geometry.icosphere import Mesh3D, create_icosphere
 from kvrrj.geometry.util import (
+    Location,
     angle_clockwise_from_north,
     angle_from_cardinal,
     angle_to_vector,
     cardinality,
     circular_weighted_mean,
+    great_circle_distance,
+    haversine,
     point_group,
 )
+
+
+def test_great_circle_distance():
+    # Test when both locations are the same
+    loc1 = Location(latitude=0, longitude=0)
+    loc2 = Location(latitude=0, longitude=0)
+    assert great_circle_distance(loc1, loc2) == pytest.approx(0.0, rel=1e-7)
+
+    # Test with known values
+    loc1 = Location(latitude=52.5200, longitude=13.4050)  # Berlin
+    loc2 = Location(latitude=48.8566, longitude=2.3522)  # Paris
+    expected_distance = 878.84 * 1000  # Approximate distance in m
+    assert great_circle_distance(loc1, loc2) == pytest.approx(
+        expected_distance, rel=1e-2
+    )
+
+    # Test with locations on opposite sides of the Earth
+    loc1 = Location(latitude=0, longitude=0)
+    loc2 = Location(latitude=0, longitude=180)
+    expected_distance = 40075.0 / 2 * 1000  # Half the Earth's circumference in m
+    assert great_circle_distance(loc1, loc2) == pytest.approx(
+        expected_distance, rel=1e-2
+    )
+
+    # Test with one location at the North Pole and another at the equator
+    loc1 = Location(latitude=90, longitude=0)
+    loc2 = Location(latitude=0, longitude=0)
+    expected_distance = 40075.0 / 4 * 1000  # Quarter of Earth's circumference in m
+    assert great_circle_distance(loc1, loc2) == pytest.approx(
+        expected_distance, rel=1e-2
+    )
+
+
+def test_haversine():
+    # Test when both locations are the same
+    loc1 = Location(latitude=0, longitude=0)
+    loc2 = Location(latitude=0, longitude=0)
+    assert haversine(loc1, loc2) == pytest.approx(0.0, rel=1e-7)
+
+    # Test with known values
+    loc1 = Location(latitude=52.5200, longitude=13.4050)  # Berlin
+    loc2 = Location(latitude=48.8566, longitude=2.3522)  # Paris
+    expected_distance = 878.84 * 1000  # Approximate distance in m
+    assert haversine(loc1, loc2) == pytest.approx(expected_distance, rel=1e-2)
+
+    # Test with locations on opposite sides of the Earth
+    loc1 = Location(latitude=0, longitude=0)
+    loc2 = Location(latitude=0, longitude=180)
+    expected_distance = 40075.0 / 2 * 1000  # Half the Earth's circumference in m
+    assert haversine(loc1, loc2) == pytest.approx(expected_distance, rel=1e-2)
+
+    # Test with one location at the North Pole and another at the equator
+    loc1 = Location(latitude=90, longitude=0)
+    loc2 = Location(latitude=0, longitude=0)
+    expected_distance = 40075.0 / 4 * 1000  # Quarter of Earth's circumference in m
+    assert haversine(loc1, loc2) == pytest.approx(expected_distance, rel=1e-2)
 
 
 def test_angle_from_cardinal():
