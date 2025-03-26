@@ -4,8 +4,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+from matplotlib.axes import Axes
 
 from kvrrj.wind import (
+    _DEFAULT_BIN_COUNT,
+    _DEFAULT_DIRECTION_COUNT,
     AnalysisPeriod,
     HourlyContinuousCollection,
     Wind,
@@ -338,11 +341,8 @@ def test_percentile():
     )
 
     # test percentiles
-    assert w.percentile(0.0) == 0  # Minimum wind speed
-    assert w.percentile(0.25) == 1  # 25th percentile
-    assert w.percentile(0.5) == 2  # Median wind speed
-    assert w.percentile(0.75) == 3  # 75th percentile
-    assert w.percentile(1.0) == 4  # Maximum wind speed
+    assert isinstance(w.percentile(0.0), dict)
+    assert w.percentile([0.25]) == {0.25: 1}  # 25th percentile
 
 
 def test_to_height():
@@ -722,10 +722,10 @@ def test_direction_bins():
     # Test with valid number of directions
     bins = Wind._direction_bins(4)
     expected_bins = [
-        [315.0, 45.0],
-        [45.0, 135.0],
-        [135.0, 225.0],
-        [225.0, 315.0],
+        (315.0, 45.0),
+        (45.0, 135.0),
+        (135.0, 225.0),
+        (225.0, 315.0),
     ]
     assert bins == expected_bins
 
@@ -744,8 +744,8 @@ def test_direction_bins():
     bins = Wind._direction_bins(360)
     assert len(bins) == 360  # Ensure correct number of bins
     assert all(len(bin) == 2 for bin in bins)  # Each bin should have two edges
-    assert bins[0] == [359.5, 0.5]  # Check the first bin
-    assert bins[-1] == [358.5, 359.5]  # Check the last bin
+    assert bins[0] == (359.5, 0.5)  # Check the first bin
+    assert bins[-1] == (358.5, 359.5)  # Check the last bin
 
 
 def test_bin_direction_data():
@@ -763,8 +763,9 @@ def test_bin_direction_data():
     )
 
     # test with default parameters
-    binned_data = w._bin_direction_data(directions=4, right=True)
+    bins, binned_data = w._bin_direction_data(directions=4, right=True)
     assert len(binned_data) == len(ws)
+    assert len(bins) == 4
     assert binned_data == [
         (315.0, 45.0),
         (315.0, 45.0),
@@ -777,7 +778,7 @@ def test_bin_direction_data():
     ]
 
     # test with `right=False`
-    binned_data = w._bin_direction_data(directions=4, right=False)
+    bins, binned_data = w._bin_direction_data(directions=4, right=False)
     assert binned_data == [
         (315.0, 45.0),
         (45.0, 135.0),
@@ -810,13 +811,14 @@ def test_bin_other_data():
     )
 
     # test with defaults
-    binned_data = w._bin_other_data()
+    bins, binned_data = w._bin_other_data()
     assert len(binned_data) == len(ws)
+    assert len(bins) == _DEFAULT_BIN_COUNT
     assert all(isinstance(bin, tuple) and len(bin) == 2 for bin in binned_data)
 
     # test with custom bin edges
     other_bins = [0, 2, 4, 6, 8]
-    binned_data = w._bin_other_data(other_bins=other_bins)
+    bins, binned_data = w._bin_other_data(other_bins=other_bins)
     expected_bins = [
         (1, 2),
         (1, 2),
@@ -827,6 +829,7 @@ def test_bin_other_data():
         (6, 8),
         (6, 8),
     ]
+    assert len(bins) == 4
     assert binned_data == expected_bins
 
     # test with invalid bin edges (max edge < max data)
@@ -851,12 +854,13 @@ def test_bin_other_data():
         w._bin_other_data(other_data=other_data[1:2])
 
     # test with integer number of bins
-    binned_data = w._bin_other_data(other_data=ws, other_bins=4)
+    bins, binned_data = w._bin_other_data(other_data=ws, other_bins=4)
+    assert len(bins) == 4
     assert len(binned_data) == len(ws)
     assert all(isinstance(bin, tuple) and len(bin) == 2 for bin in binned_data)
 
 
-def test_bin_data():
+def test_apply_directional_factors():
     # create data
     datetimes = [datetime(2021, 1, 1, 0, 0) + timedelta(hours=i) for i in range(8)]
     ws = [1, 2, 3, 4, 5, 6, 7, 8]
@@ -870,32 +874,165 @@ def test_bin_data():
         height_above_ground=10,
     )
 
-    # test with custom number of directions
-    binned_data = w.bin_data(
-        directions=4,
+    # test with 4 directions and valid factors
+    adjusted_wind = w.apply_directional_factors(
+        directions=4, factors=(0.5, 0.75, 1, 0.75)
     )
-    assert isinstance(binned_data, pd.DataFrame)
-    assert len(binned_data) == len(ws)
-    assert all(
-        isinstance(bin, tuple) and len(bin) == 2 for bin in binned_data["direction"]
+    expected_speeds = [
+        0.5,
+        1.0,
+        2.25,
+        3.0,
+        5.0,
+        6.0,
+        5.25,
+        6.0,
+    ]
+    assert isinstance(adjusted_wind, Wind)
+    assert adjusted_wind.wind_speeds == expected_speeds  # Adjusted wind speeds
+    assert adjusted_wind.wind_directions == wd  # Directions remain unchanged
+    assert adjusted_wind.datetimes == datetimes  # Datetimes remain unchanged
+    assert (
+        adjusted_wind.source
+        == f"{w.source} (adjusted by factors {{(315.0, 45.0): 0.5, (45.0, 135.0): 0.75, (135.0, 225.0): 1, (225.0, 315.0): 0.75}})"
     )
+
+    # test with 8 directions and valid factors
+    adjusted_wind = w.apply_directional_factors(
+        directions=8, factors=(0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2)
+    )
+    expected_speeds = [
+        0.5,
+        1.2,
+        2.0999999999999996,
+        3.2,
+        4.5,
+        6.0,
+        7.700000000000001,
+        9.6,
+    ]
+    assert isinstance(adjusted_wind, Wind)
+    assert adjusted_wind.wind_speeds == expected_speeds  # Adjusted wind speeds
+    assert adjusted_wind.wind_directions == wd  # Directions remain unchanged
+    assert adjusted_wind.datetimes == datetimes  # Datetimes remain unchanged
+
+    # test with invalid number of factors
+    with pytest.raises(
+        ValueError,
+        match="number of factors \\(3\\) must equal number of directions \\(4\\)",
+    ):
+        w.apply_directional_factors(directions=4, factors=(0.5, 0.75, 1))
+
+    # test with exclusive right edge
+    adjusted_wind = w.apply_directional_factors(
+        directions=4, factors=(0.5, 0.75, 1, 0.75), right=False
+    )
+    expected_speeds = [0.5, 1.5, 2.25, 4.0, 5.0, 4.5, 5.25, 4.0]
+    assert isinstance(adjusted_wind, Wind)
+    assert adjusted_wind.wind_speeds == expected_speeds  # Adjusted wind speeds
+    assert adjusted_wind.wind_directions == wd  # Directions remain unchanged
+    assert adjusted_wind.datetimes == datetimes  # Datetimes remain unchanged
+
+
+def test_histogram():
+    # create data
+    datetimes = [datetime(2021, 1, 1, 0, 0) + timedelta(hours=i) for i in range(8)]
+    ws = [1, 2, 3, 4, 5, 6, 7, 8]
+    wd = [0, 45, 90, 135, 180, 225, 270, 315]
+
+    # create wind object
+    w = Wind(
+        wind_speeds=ws,
+        wind_directions=wd,
+        datetimes=datetimes,
+        height_above_ground=10,
+    )
+
+    # test with default parameters
+    histogram = w.histogram()
+    assert isinstance(histogram, pd.DataFrame)
+    assert histogram.shape == (
+        _DEFAULT_DIRECTION_COUNT,
+        _DEFAULT_BIN_COUNT,
+    )  # Default 12 directions and 11 bins
+    assert histogram.values.sum() == len(ws)  # Total counts should match data length
+
+    # test with custom number of directions and bins
+    histogram = w.histogram(directions=4, other_bins=4)
+    assert histogram.shape == (4, 4)  # 4 directions and 4 bins
+    assert histogram.values.sum() == len(ws)  # Total counts should match data length
+
+    # test with density=True
+    histogram = w.histogram(directions=4, other_bins=4, density=True)
+    assert histogram.values.sum() == pytest.approx(
+        1.0
+    )  # Sum of probabilities should be 1
 
     # test with custom other_data
     other_data = [10, 20, 30, 40, 50, 60, 70, 80]
-    binned_data = w.bin_data(other_data=other_data)
-    assert isinstance(binned_data, pd.DataFrame)
-    assert len(binned_data) == len(ws)
-    assert all(isinstance(bin, tuple) and len(bin) == 2 for bin in binned_data["other"])
+    histogram = w.histogram(other_data=other_data, other_bins=4)
+    assert histogram.shape == (
+        _DEFAULT_DIRECTION_COUNT,
+        4,
+    )  # Default 36 directions and 4 bins
+    assert histogram.values.sum() == len(
+        other_data
+    )  # Total counts should match other_data length
 
-    # test with custom other_bins
-    custom_bins = [0, 20, 40, 60, 80]
-    binned_data = w.bin_data(other_data=other_data, other_bins=custom_bins)
-    assert isinstance(binned_data, pd.DataFrame)
-    assert len(binned_data) == len(ws)
-    assert all(isinstance(bin, tuple) and len(bin) == 2 for bin in binned_data["other"])
+    # test with exclusive right edges
+    histogram = w.histogram(
+        directions=4, other_bins=4, directions_right=False, other_right=False
+    )
+    assert histogram.shape == (4, 4)  # 4 directions and 4 bins
+    assert histogram.values.sum() == len(ws)  # Total counts should match data length
 
-    # test with integer number of bins
-    binned_data = w.bin_data(other_data=other_data, other_bins=4)
-    assert isinstance(binned_data, pd.DataFrame)
-    assert len(binned_data) == len(ws)
-    assert all(isinstance(bin, tuple) and len(bin) == 2 for bin in binned_data["other"])
+    # test with no matching data
+    with pytest.raises(ValueError):
+        w.histogram(directions=4, other_bins=[100, 200])  # Bins outside data range
+
+
+def test_wind_matrix():
+    # create wind object
+    w = Wind.from_epw(EPW_OBJ)
+
+    # test with default other_data (wind speeds)
+    matrix = w.wind_matrix()
+    assert isinstance(matrix, pd.DataFrame)
+    assert matrix.values.sum() == 53262.092553978495
+    assert matrix.shape == (24, 24)  # 24 hours x 12 months x 2
+
+    # test with custom other_data
+    other_data = [10] * len(w)
+    matrix = w.wind_matrix(other_data=other_data)
+    assert isinstance(matrix, pd.DataFrame)
+    assert matrix.values.sum() == 55209.24164
+    assert matrix.shape == (24, 24)  # 24 hours x 12 months x 2
+
+    # test with mismatched other_data length
+    mismatched_other_data = [10, 20, 30]
+    with pytest.raises(
+        ValueError, match="other_data must be the same length as the wind data."
+    ):
+        w.wind_matrix(other_data=pd.Series(mismatched_other_data))
+
+    # test with missing data
+    w_missing = w.filter_by_time(hours=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9))
+    with pytest.raises(
+        ValueError,
+        match="Wind object must contain at least 1 value per-hour, per-month to create a matrix.",
+    ):
+        w_missing.wind_matrix()
+
+
+def test_plot_wind_matrix():
+    # create wind object
+    w = Wind.from_epw(EPW_OBJ)
+    # plot
+    assert isinstance(w.plot_windmatrix(), Axes)
+
+
+def test_plot_windrose():
+    # create wind object
+    w = Wind.from_epw(EPW_OBJ)
+    # plot
+    assert isinstance(w.plot_windrose(), Axes)

@@ -1,4 +1,7 @@
 # import all datatypes
+import warnings
+
+from ladybug.datatype import TYPESDICT
 from ladybug.datatype.angle import Angle, WindDirection
 from ladybug.datatype.area import Area
 from ladybug.datatype.base import DataTypeBase
@@ -44,6 +47,7 @@ from ladybug.datatype.fraction import (
     RelativeHumidity,
     TotalSkyCover,
 )
+from ladybug.datatype.generic import GenericType
 from ladybug.datatype.illuminance import (
     DiffuseHorizontalIlluminance,
     DirectNormalIlluminance,
@@ -128,6 +132,29 @@ def datatype_to_string(datatype: DataTypeBase, unit: str) -> str:
     """
 
     return f"{datatype} ({unit})"
+
+
+def datatype_from_string(text: str) -> DataTypeBase:
+    """Convert a string to a ladybug datatype."""
+
+    str_elements = text.split(" ")
+
+    if (len(str_elements) < 2) or ("(" not in text) or (")" not in text):
+        raise ValueError(
+            "The string to be converted into a LB Datatype must be in the format 'variable (unit)'"
+        )
+
+    str_elements = text.split(" ")
+    unit = str_elements[-1].replace("(", "").replace(")", "")
+    data_type = " ".join(str_elements[:-1])
+
+    try:
+        return TYPESDICT[data_type.replace(" ", "")]()
+    except KeyError:
+        warnings.warn(
+            f"Datatype {data_type} not found in ladybug library. Returning generic datatype."
+        )
+        return GenericType(name=data_type, unit=unit)
 
 
 def datatype_to_color(datatype: DataTypeBase) -> str:

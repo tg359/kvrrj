@@ -18,6 +18,7 @@
     "python.testing.autoTestDiscoverOnSaveEnabled": true,
     // UI settings
     "terminal.integrated.hideOnStartup": "never",
+    "files.autoSave": "off",
     // better comments settings
     "better-comments.tags": [
         {
@@ -146,7 +147,7 @@
             "bold": false,
             "italic": false
         }
-    ]
+    ],
     // todo-tree settings
     "todo-tree.tree.scanAtStartup": false,
     "todo-tree.highlights.enabled": false,
@@ -178,18 +179,18 @@
             "mark"
         ]
     },
-    "todo-tree.regex.regex": "((//|#|<!--|;|/\\*|^)((\\s+(!|\\?|\\*|\\-))?(\\s+\\[ \\])?|(\\s+(!|\\?|\\*)\\s+\\[.\\])?)\\s*($TAGS)\\s*\\:)",
-    "todo-tree.highlights.customHighlight": {
-        "TODO": {
-            "icon": "checklist"
-        },
-        "BUG": {
-            "icon": "bug"
-        },
-        "MARK": {
-            "icon": "bookmark"
-        }
-    },
-    "todo-tree.tree.labelFormat": "${tag:uppercase} ${after} [${filename}]",
-    "todo-tree.tree.tooltipFormat": "${filename}:[${line}] in ${filepath}",
+    "todo-tree.regex.regex": "((//|#|<!--|;|/\\*|^)((\\s+(!|\\?|\\*|\\-))?(\\s+\\[ \\])?|(\\s+(!|\\?|\\*)\\s+\\[.\\])?)\\s*($TAGS)\\s*)",
+    // "todo-tree.highlights.customHighlight": {
+    //     "TODO": {
+    //         "icon": "checklist"
+    //     },
+    //     "BUG": {
+    //         "icon": "bug"
+    //     },
+    //     "MARK": {
+    //         "icon": "bookmark"
+    //     }
+    // },
+    // "todo-tree.tree.labelFormat": "${tag:uppercase} ${after} [${filename}]",
+    // "todo-tree.tree.tooltipFormat": "${filename}:[${line}] in ${filepath}",
 }

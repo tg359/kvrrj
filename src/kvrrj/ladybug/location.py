@@ -103,12 +103,12 @@ def average_location(
         ]
     )
     return Location(
-        city=f"Synthetic ({city})",
-        state=f"Synthetic ({state})",
-        country=f"Synthetic ({country})",
-        latitude=lat,  # type: ignore
-        longitude=lon,  # type: ignore
-        elevation=elv,  # type: ignore
-        station_id=f"Synthetic ({station_id})",
-        source=f"Synthetic ({source})",
+        city=city,
+        state=state,
+        country=country,
+        latitude=lat,
+        longitude=lon,
+        elevation=elv,
+        station_id=station_id,
+        source=source,
     )

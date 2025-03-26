@@ -1544,6 +1544,7 @@ dependencies = [
     { name = "matplotlib" },
     { name = "meteostat" },
     { name = "multivolumefile" },
+    { name = "nptyping" },
     { name = "numpy" },
     { name = "openpyxl" },
     { name = "packaging" },
@@ -1653,6 +1654,7 @@ requires-dist = [
     { name = "matplotlib", specifier = "==3.9.1" },
     { name = "meteostat", specifier = ">=1.6.8" },
     { name = "multivolumefile", specifier = "==0.2.3" },
+    { name = "nptyping", specifier = ">=2.0.1" },
     { name = "numpy", specifier = "==2.0.1" },
     { name = "openpyxl", specifier = ">=3.1.5" },
     { name = "packaging", specifier = "==24.1" },
@@ -2178,6 +2180,17 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/fd/1d/06475e1cd5264c0b870ea2cc6fdb3e37177c1e565c43f56ff17a10e3937f/networkx-3.4.2.tar.gz", hash = "sha256:307c3669428c5362aab27c8a1260aa8f47c4e91d3891f48be0141738d8d053e1", size = 2151368 }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b9/54/dd730b32ea14ea797530a4479b2ed46a6fb250f682a9cfb997e968bf0261/networkx-3.4.2-py3-none-any.whl", hash = "sha256:df5d4365b724cf81b8c6a7312509d0c22386097011ad1abe274afd5e9d3bbc5f", size = 1723263 },
+]
+
+[[package]]
+name = "nptyping"
+version = "2.0.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/48/03/3f5af42a8858c223f1a4b1d5a773f3a4f7cb9ae9dcbd1ad61bdb8539e633/nptyping-2.0.1-py3-none-any.whl", hash = "sha256:0fc5c4d76c65e12a77e750b9e2701dab6468d00926c8c4f383867bd70598a532", size = 19435 },
 ]
 
 [[package]]

@@ -1,9 +1,10 @@
 """Methods for manipulating Ladybug analysis periods."""
 
 import calendar
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
+import pandas as pd
 from ladybug.analysisperiod import AnalysisPeriod
 from ladybug.dt import DateTime as lbdatetime
 
@@ -74,6 +75,28 @@ def lbdatetime_from_datetime(dt: datetime) -> lbdatetime:
     )
 
 
+def lbdatetime_to_dict(dt: lbdatetime) -> dict[str : bool | int]:
+    """Convert a Ladybug DateTime object into a dictionary."""
+    return {
+        "month": dt.month,
+        "day": dt.day,
+        "hour": dt.hour,
+        "minute": dt.minute,
+        "leap_year": dt.leap_year,
+    }
+
+
+def lbdatetime_from_dict(dt_dict: dict[str : bool | int]) -> lbdatetime:
+    """Convert a dictionary into a Ladybug DateTime object."""
+    return lbdatetime(
+        month=dt_dict["month"],
+        day=dt_dict["day"],
+        hour=dt_dict["hour"],
+        minute=dt_dict["minute"],
+        leap_year=dt_dict["leap_year"],
+    )
+
+
 def analysis_period_to_datetimes(analysis_period: AnalysisPeriod) -> list[datetime]:
     """Convert an AnalysisPeriod object into a list of datetimes.
 
@@ -135,6 +158,34 @@ def analysis_period_from_datetimes(
             "datetime-list has an irregular time-step and cannot be coerced into an AnalysisPeriod."
         )
     return analysis_period
+
+
+def analysis_period_from_timedelta(
+    td: timedelta | pd.Timedelta, is_leap_year: bool
+) -> AnalysisPeriod:
+    """Create an AnalysisPeriod object from a timedelta object.
+
+    Args:
+        td (timedelta):
+            A Python timedelta object.
+        is_leap_year (bool):
+            A boolean to indicate whether the year is a leap year.
+
+    Returns:
+        AnalysisPeriod:
+            An AnalysisPeriod object.
+    """
+    if not isinstance(td, (timedelta, pd.Timedelta)):
+        raise ValueError("td must be a timedelta object.")
+
+    return AnalysisPeriod(timestep=int(td.seconds / 3600), is_leap_year=is_leap_year)
+
+
+def analysis_period_from_pd_freq(freq: str, is_leap_year: bool) -> AnalysisPeriod:
+    """Given a pandas frequency string, create an AnalysisPeriod object."""
+
+    td = pd.to_timedelta(pd.tseries.frequencies.to_offset(freq))
+    return analysis_period_from_timedelta(td, is_leap_year)
 
 
 def analysis_period_to_string(
