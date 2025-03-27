@@ -1,11 +1,25 @@
 """Methods for handling solar data. This module relies heavily on numpy, pandas, and ladybug."""
 
+# TODO - From openmeteo
+# TODO - Shade benefit calc (on window)
+# TODO - Shade benefit calc on comfort exterbal
+# TODO - PV calc
+# TODO - PV with shade objects (from sky matrix?)
+# TODO - From NOAA?
+# TODO - New openmeteo method? Save location id and daily data as separate files
+# TODO - Use raddome for creating the TOF data
+# TODO - Reimplement down sample to enable finer grained shade studry
+# TODO - Use DirectSun/RadiationStudy to calculate shadedness of a point given context meshes
+# TODO - Add location to wind object
+# TODO - load shade objects from a file/create shades, and compute the benefit matrix?
+
 import concurrent
 import inspect
 import json
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from enum import Enum, auto
 from pathlib import Path
 from typing import Any
 
@@ -21,18 +35,47 @@ from ladybug.datatype.temperature import Temperature
 from ladybug.epw import EPW, Header, HourlyContinuousCollection
 from ladybug.sunpath import Location
 from ladybug.wea import Wea
+from ladybug_geometry.geometry3d import (
+    Face3D,
+    LineSegment3D,
+    Mesh3D,
+    Plane,
+    Point3D,
+    Vector3D,
+)
 from ladybug_radiance.skymatrix import SkyMatrix
+from ladybug_radiance.study.radiation import RadiationStudy
+from ladybug_radiance.visualize.raddome import RadiationDome
 from ladybug_radiance.visualize.radrose import RadiationRose
+from matplotlib import pyplot as plt
+from matplotlib.axes import Axes
 from tqdm import tqdm
+
+from kvrrj.geometry.util import vector3d_to_azimuth_altitude
+from kvrrj.viz.color import contrasting_color
 
 from .ladybug.analysis_period import (
     AnalysisPeriod,
     analysis_period_from_datetimes,
     analysis_period_from_pd_freq,
+    analysis_period_to_string,
 )
 from .logging import CONSOLE_LOGGER  # noqa: F401
 
 _LOCATION_ARGS = inspect.signature(Location).parameters.keys()
+
+
+class IrradianceType(Enum):
+    """Irradiance types."""
+
+    TOTAL = auto()
+    DIRECT = auto()
+    DIFFUSE = auto()
+    REFLECTED = auto()
+
+    def to_string(self) -> str:
+        """Get the string representation of the IrradianceType."""
+        return f"{self.name.title()} irradiance"
 
 
 @dataclass
@@ -163,6 +206,71 @@ class Solar:
         if isinstance(object, np.ndarray):
             if not np.issubdtype(object.dtype, np.number):
                 raise ValueError("The other object must be numeric.")
+
+    @staticmethod
+    def _create_single_face_mesh(
+        azimuth: float,
+        altitude: float,
+        height_above_ground: float,
+        radius: float = 0.01,
+    ) -> Mesh3D:
+        """Create a single face mesh for a given azimuth and altitude.
+
+        Args:
+            azimuth (float):
+                The azimuth angle in degrees clockwise from north.
+            altitude (float):
+                The altitude angle in degrees.
+            height_above_ground (float):
+                The height above ground in m.
+        """
+
+        if azimuth > 360 or azimuth < 0:
+            raise ValueError("azimuth must be between 0 and 360.")
+        if altitude > 90 or altitude < -90:
+            raise ValueError("altitude must be between -90 and 90.")
+        if height_above_ground < 0:
+            raise ValueError("height_above_ground must be greater than or equal to 0.")
+
+        vec3d = (
+            Vector3D(0, 1, 0)
+            .rotate(axis=Vector3D(1, 0, 0), angle=np.deg2rad(altitude))
+            .rotate_xy(np.deg2rad(-azimuth))
+        )
+        plane = Plane(n=vec3d, o=Point3D(0, 0, height_above_ground))
+        face = Face3D.from_regular_polygon(
+            side_count=4, radius=radius, base_plane=plane
+        )
+        return Mesh3D.from_face_vertices([face])
+
+    @staticmethod
+    def _create_azimuth_mesh(directions: int = 36, tilt_angle: float = 0) -> Mesh3D:
+        """CReate a mesh of faces for a given number of directions and tilt angle.
+
+        This is used to creation the radiation rose, with one face per direction.
+
+        Args:
+            directions (int, optional):
+                The number of directions to divide the rose into.
+                Default is 36.
+            tilt_angle (float, optional):
+                The tilt angle in degrees from horizontal. 0 is horizontal, 90 is upwards.
+                Default is 0.
+
+        Returns:
+            Mesh3D:
+                A ladybug Mesh3D object
+        """
+
+        angles = np.linspace(0, 360, directions, endpoint=False)
+        base_face = Face3D.from_extrusion(
+            line_segment=LineSegment3D(p=Point3D(0.05, 0.1, 0), v=Vector3D(-0.1, 0, 0)),
+            extrusion_vector=Vector3D(0, 0, 0.1),
+        ).rotate(axis=Vector3D(1, 0, 0), angle=np.deg2rad(tilt_angle), origin=Point3D())
+        faces = [
+            base_face.rotate_xy(angle=np.deg2rad(-a), origin=Point3D()) for a in angles
+        ]
+        return Mesh3D.from_face_vertices(faces=faces)
 
     # endregion: STATIC METHODS
 
@@ -372,8 +480,12 @@ class Solar:
         if isinstance(epw, (str, Path)):
             epw = EPW(epw)
 
+        # modify location to state the EPW file in the source field
+        loc = epw.location
+        loc.source = f"{Path(epw.file_path).name}"
+
         return cls(
-            location=epw.location,
+            location=loc,
             analysis_period=epw.dry_bulb_temperature.header.analysis_period,
             direct_normal_irradiance=epw.direct_normal_radiation.values,
             diffuse_horizontal_irradiance=epw.diffuse_horizontal_radiation.values,
@@ -595,6 +707,10 @@ class Solar:
             balance_offset (float, optional):
                 The offset from the balance temperature.
                 Default is 2.
+
+        Returns:
+            SkyMatrix:
+                A ladybug SkyMatrix object.
         """
         if temperature is None:
             return SkyMatrix(
@@ -627,24 +743,7 @@ class Solar:
             balance_offset=balance_offset,
         )
 
-    def to_lb_radiation_rose(
-        self,
-        directions: int = 36,
-        tilt_angle: float = 0,
-        north: int = 0,
-        high_density: bool = True,
-        ground_reflectance: float = 0.2,
-    ) -> RadiationRose:
-        return RadiationRose(
-            sky_matrix=self.to_lb_sky_matrix(
-                north=north,
-                high_density=high_density,
-                ground_reflectance=ground_reflectance,
-            ),
-            direction_count=directions,
-            tilt_angle=tilt_angle,
-        )
-
+    # TODO - reimplement this
     def radiation_benefit(
         self,
         north: int = 0,
@@ -663,6 +762,7 @@ class Solar:
             balance_temperature=balance_temperature,
             balance_offset=balance_offset,
         )
+        smx._benefit_matrix
         # replace None values with NaN
         d = []
         for i in smx.benefit_matrix:
@@ -673,6 +773,95 @@ class Solar:
             else:
                 d.append(-1.0)
         return pd.Series(d, index=self.index, name="Radiation Benefit")
+
+    def to_lb_radiation_rose(
+        self,
+        directions: int = 36,
+        tilt_angle: float = 90,
+        north: int = 0,
+        high_density: bool = True,
+        ground_reflectance: float = 0.2,
+    ) -> RadiationRose:
+        """Convert this object to a ladybug RadiationRose object.
+
+        Args:
+            directions (int, optional):
+                The number of directions to divide the rose into.
+                Default is 36.
+            tilt_angle (float, optional):
+                The tilt angle in degrees from horizontal. 0 is horizontal, 90 is upwards.
+                Default is 90.
+            north (int, optional):
+                The north direction in degrees.
+                Default is 0.
+            high_density (bool, optional):
+                If True, the sky matrix will be created with high density.
+                Default is True.
+            ground_reflectance (float, optional):
+                The ground reflectance value.
+                Default is 0.2.
+
+        Returns:
+            RadiationRose:
+                A ladybug RadiationRose object.
+        """
+
+        return RadiationRose(
+            sky_matrix=self.to_lb_sky_matrix(
+                north=north,
+                high_density=high_density,
+                ground_reflectance=ground_reflectance,
+            ),
+            direction_count=directions,
+            tilt_angle=tilt_angle,
+        )
+
+    def to_lb_radiation_study(
+        self,
+        **kwargs,
+    ) -> RadiationStudy:
+        """Convert this object to a ladybug RadiationStudy object.
+
+        Args:
+            **kwargs (dict[str, Any]):
+                A set of keyword arguments to pass to the Ladybug SkyMatrix and RadiationStudy constructors.
+
+        Returns:
+            RadiationStudy:
+                A ladybug RadiationStudy object.
+        """
+
+        # get the skymatrix kwargs
+        smx_kwargs = list(inspect.signature(SkyMatrix).parameters)
+        smx_dict = {k: kwargs.pop(k) for k in dict(kwargs) if k in smx_kwargs}
+        wea = smx_dict.pop("wea", self.lb_wea)
+        smx = SkyMatrix(wea=wea, **smx_dict)
+
+        # create the radiation study
+        rs_kwargs = list(inspect.signature(RadiationStudy).parameters)
+        rs_dict = {k: kwargs.pop(k) for k in dict(kwargs) if k in rs_kwargs}
+        sky_matrix = rs_dict.pop("sky_matrix", smx)
+        study_mesh = rs_dict.pop(
+            "study_mesh",
+            self._create_single_face_mesh(
+                azimuth=180, altitude=90, height_above_ground=0
+            ),
+        )
+        context_geometry = rs_dict.pop(
+            "context_geometry",
+            [],
+        )
+        return RadiationStudy(
+            sky_matrix=sky_matrix,
+            study_mesh=study_mesh,
+            context_geometry=context_geometry,
+            **rs_dict,
+        )
+
+    def to_lb_radiation_dome(self) -> RadiationDome:
+        # TODO - implement this
+        RadiationDome()
+        raise NotImplementedError("This method is not yet implemented.")
 
     def directional_irradiance(
         self,
@@ -713,6 +902,8 @@ class Solar:
     ) -> pd.DataFrame:
         """Calculate irradiance values for a number of tilts and orientations."""
 
+        # TODO-  make this function wokr, and transform the output into a table of form [rad_types, [aziumths, altitudes]]
+
         # create list of tilts
         if isinstance(n_altitudes, int):
             altitudes = np.linspace(0, 90, n_altitudes)
@@ -749,3 +940,377 @@ class Solar:
         return np.array(dfs)
 
     # endregion: INSTANCE METHODS
+
+    # region: PLOTTING METHODS
+
+    def directional_radiation(
+        self,
+        analysis_period: AnalysisPeriod = AnalysisPeriod(),
+        directions: int = 36,
+        tilt_angle: float = 89.999,
+        north: int = 0,
+        high_density: bool = True,
+        ground_reflectance: float = 0.2,
+        shade_objects: list[Any] = (),
+    ) -> pd.DataFrame:
+        """Get directional cumulative radiation in kWh/m2 for a given
+        tilt_angle, within the analysis_period and subject to shade_objects.
+
+        Args:
+            irradiance_type (IrradianceType, optional):
+                The type of irradiance to plot. Defaults to IrradianceType.TOTAL.
+            analysis_period (AnalysisPeriod, optional):
+                The analysis period over which radiation shall be summarised.
+                Defaults to AnalysisPeriod().
+            directions (int, optional):
+                The number of directions to bin data into.
+                Defaults to 36.
+            tilt_angle (float, optional):
+                The tilt (from 0 at horizon, to 90 facing the sky) to assess.
+                Defaults to 89.999.
+            north (int, optional):
+                The north direction in degrees.
+                Defaults to 0.
+            high_density (bool, optional):
+                If True, the sky matrix will be created with high density.
+                Defaults to True.
+            ground_reflectance (float, optional):
+                The reflectance of the ground.
+                Defaults to 0.2.
+            shade_objects (list, optional):
+                A list of shades to apply to the plot.
+                Defaults to an empty list.
+
+        Returns:
+            pd.DataFrame:
+                A pandas DataFrame containing the radiation data.
+        """
+
+        # create time-filtered sky-matrix
+        smx = SkyMatrix.from_components(
+            location=self.location,
+            direct_normal_irradiance=self.lb_direct_normal_irradiance,
+            diffuse_horizontal_irradiance=self.lb_diffuse_horizontal_irradiance,
+            hoys=analysis_period.hoys,
+            north=north,
+            high_density=high_density,
+            ground_reflectance=ground_reflectance,
+        )
+
+        # create a mesh with the same dumber of faces as the number of
+        sensor_mesh = self._create_azimuth_mesh(directions, tilt_angle)
+
+        # create a radiation study and intersection matrix from given mesh/objects
+        rd = RadiationStudy(
+            sky_matrix=smx,
+            study_mesh=sensor_mesh,
+            context_geometry=shade_objects,
+            use_radiance_mesh=True,
+        )
+
+        # create rad rose
+        lb_radrose = RadiationRose(
+            sky_matrix=smx,
+            intersection_matrix=rd.intersection_matrix,
+            direction_count=directions,
+            tilt_angle=tilt_angle,
+        )
+
+        # get angles
+        angles = np.linspace(0, 360, directions, endpoint=False)
+
+        # get the radiation data
+        return pd.concat(
+            [
+                pd.Series(
+                    lb_radrose.total_values,
+                    index=angles,
+                    name=IrradianceType.TOTAL.to_string(),
+                ),
+                pd.Series(
+                    lb_radrose.direct_values,
+                    index=angles,
+                    name=IrradianceType.DIRECT.to_string(),
+                ),
+                pd.Series(
+                    lb_radrose.diffuse_values,
+                    index=angles,
+                    name=IrradianceType.DIFFUSE.to_string(),
+                ),
+            ],
+            axis=1,
+        )
+
+    def plot_radrose(
+        self,
+        ax: Axes | None = None,
+        irradiance_type: IrradianceType = IrradianceType.TOTAL,
+        analysis_period: AnalysisPeriod = AnalysisPeriod(),
+        directions: int = 36,
+        tilt_angle: float = 90,
+        north: int = 0,
+        high_density: bool = True,
+        ground_reflectance: float = 0.2,
+        shade_objects: list[Any] = (),
+        **kwargs,
+    ) -> Axes:
+        """Plot a radiation rose for the given solar data.
+
+        Args:
+            ax (Axes, optional):
+                The matplotlib Axes to plot the radiation rose on.
+            irradiance_type (IrradianceType, optional):
+                The type of irradiance to plot. Defaults to IrradianceType.TOTAL.
+            analysis_period (AnalysisPeriod, optional):
+                The analysis period over which radiation shall be summarised.
+                Defaults to AnalysisPeriod().
+            directions (int, optional):
+                The number of directions to bin data into.
+                Defaults to 36.
+            tilt_angle (float, optional):
+                The tilt (from 0 at horizon, to 90 facing the sky) to assess.
+                Defaults to 90.
+            north (int, optional):
+                The north direction in degrees.
+                Defaults to 0.
+            high_density (bool, optional):
+                If True, the sky matrix will be created with high density.
+                Defaults to True.
+            ground_reflectance (float, optional):
+                The reflectance of the ground.
+                Defaults to 0.2.
+            shade_objects (list, optional):
+                A list of shades to apply to the plot.
+                Defaults to an empty list.
+        """
+
+        if irradiance_type == IrradianceType.REFLECTED:
+            raise ValueError(
+                "The REFLECTED irradiance type is not supported for plotting a radiation rose."
+            )
+
+        # create radiation results
+        rad_df = self.directional_radiation(
+            analysis_period=analysis_period,
+            directions=directions,
+            tilt_angle=tilt_angle,
+            north=north,
+            high_density=high_density,
+            ground_reflectance=ground_reflectance,
+            shade_objects=shade_objects,
+        )
+
+        # get the radiation data
+        match irradiance_type:
+            case IrradianceType.TOTAL:
+                data = rad_df[IrradianceType.TOTAL.to_string()]
+            case IrradianceType.DIRECT:
+                data = rad_df[IrradianceType.DIRECT.to_string()]
+            case IrradianceType.DIFFUSE:
+                data = rad_df[IrradianceType.DIFFUSE.to_string()]
+            case _:
+                raise ValueError("How did you get here?")
+
+        # plot the radiation rose
+
+        if ax is None:
+            _, ax = plt.subplots(subplot_kw={"projection": "polar"})
+        if ax.name != "polar":
+            raise ValueError("ax must be a polar axis.")
+
+        # kwargish vars
+        # todo - sort out kwargs
+        ylim = kwargs.pop("ylim", (0, max(data) * 1.1))
+        if len(ylim) != 2:
+            raise ValueError("ylim must be a tuple of length 2.")
+        bar_width = 1
+        colors = plt.get_cmap("YlOrRd")(
+            np.interp(data.values, (data.min(), data.max() * 1.05), (0, 1))
+        )
+        title = f"{self.location.source}\n{analysis_period_to_string(analysis_period)}"
+
+        rects = ax.bar(
+            x=np.deg2rad(data.index),
+            height=data.values,
+            width=((np.pi / directions) * 2) * bar_width,
+            color=colors,
+        )
+
+        # add a text label to the peak value bar
+        peak_value = max(data.values)
+        peak_angle_deg = data.idxmax()
+        peak_angle_rad = np.deg2rad(data.idxmax())
+        peak_index = np.argmax(data.values)
+        peak_bar = rects[peak_index]
+        peak_bar.set_edgecolor("black")
+        peak_bar.set_zorder(5)
+        ax.text(
+            peak_angle_rad,
+            peak_value * 0.95,
+            f"{peak_value:.0f}kWh/m$^2$",
+            fontsize="xx-small",
+            ha="right" if peak_angle_deg < 180 else "left",
+            va="center",
+            rotation=(90 - peak_angle_deg)
+            if peak_angle_deg < 180
+            else (90 - peak_angle_deg + 180),
+            rotation_mode="anchor",
+            color=contrasting_color(peak_bar.get_facecolor()),
+            zorder=5,
+        )
+
+        # format the plot
+        ax.set_title(title)
+        ax.set_theta_zero_location("N")
+        ax.set_theta_direction(-1)
+        ax.set_ylim(ylim)
+        ax.spines["polar"].set_visible(False)
+        ax.grid(True, which="both", ls="--", zorder=0, alpha=0.3)
+        ax.yaxis.set_major_locator(plt.MaxNLocator(6))
+        plt.setp(ax.get_yticklabels(), fontsize="small")
+        ax.set_xticks(np.radians((0, 90, 180, 270)), minor=False)
+        ax.set_xticklabels(("N", "E", "S", "W"), minor=False, **{"fontsize": "medium"})
+        ax.set_xticks(
+            np.radians(
+                (
+                    22.5,
+                    45,
+                    67.5,
+                    112.5,
+                    135,
+                    157.5,
+                    202.5,
+                    225,
+                    247.5,
+                    292.5,
+                    315,
+                    337.5,
+                )
+            ),
+            minor=True,
+        )
+        ax.set_xticklabels(
+            (
+                "NNE",
+                "NE",
+                "ENE",
+                "ESE",
+                "SE",
+                "SSE",
+                "SSW",
+                "SW",
+                "WSW",
+                "WNW",
+                "NW",
+                "NNW",
+            ),
+            minor=True,
+            **{"fontsize": "x-small"},
+        )
+
+        return ax
+
+    def plot_tilt_orientation_factor(
+        self,
+        ax: Axes | None = None,
+        irradiance_type: IrradianceType = IrradianceType.TOTAL,
+        analysis_period: AnalysisPeriod = AnalysisPeriod(),
+        azimuth_count: int = 36,
+        altitude_count: int = 9,
+        shade_objects: list[Any] = (),
+    ) -> Axes:
+        if irradiance_type == IrradianceType.REFLECTED:
+            raise ValueError(
+                "The REFLECTED irradiance type is not supported for plotting a tilt-orientation-factor diagram."
+            )
+
+        # create time-filtered sky-matrix
+        smx = SkyMatrix.from_components(
+            location=self.location,
+            direct_normal_irradiance=self.lb_direct_normal_irradiance,
+            diffuse_horizontal_irradiance=self.lb_diffuse_horizontal_irradiance,
+            hoys=analysis_period.hoys,
+            high_density=True,
+        )
+
+        # if shade objects are passed, create a sensor mesh
+
+        # create a dome mesh, but really small to check for intersections with shade_objects
+        dome_vectors = RadiationDome.dome_vectors(
+            azimuth_count=azimuth_count, altitude_count=altitude_count
+        )
+        faces = []
+        for v in dome_vectors:
+            faces.append(
+                Face3D.from_regular_polygon(
+                    side_count=3,
+                    radius=0.001,
+                    base_plane=Plane(n=v, o=Point3D().move(v * 0.001)),
+                )
+            )
+        sensor_mesh = Mesh3D.from_face_vertices(faces=faces)
+
+        # create a radiation study and intersection matrix from given mesh/objects
+        rs = RadiationStudy(
+            sky_matrix=smx,
+            study_mesh=sensor_mesh,
+            context_geometry=shade_objects,
+            use_radiance_mesh=True,
+        )
+        intersection_matrix = rs.intersection_matrix
+
+        # create a radiation dome
+        rd = RadiationDome(
+            smx,
+            intersection_matrix=intersection_matrix,
+            azimuth_count=azimuth_count,
+            altitude_count=altitude_count,
+        )
+
+        # get the raw data
+        azimuths, altitudes = np.array(
+            [vector3d_to_azimuth_altitude(i) for i in rd.direction_vectors]
+        ).T
+        match irradiance_type:
+            case IrradianceType.TOTAL:
+                values = np.array(rd.total_values)
+            case IrradianceType.DIRECT:
+                values = np.array(rd.direct_values)
+            case IrradianceType.DIFFUSE:
+                values = np.array(rd.diffuse_values)
+            case _:
+                raise ValueError("How did you get here?")
+
+        # create a dataframe containing the results
+        df = pd.DataFrame(
+            {
+                "azimuth": azimuths,
+                "altitude": altitudes,
+                "value": values,
+            }
+        ).sort_values(by=["azimuth", "altitude"])
+
+        # add in  missing extremity values
+        # todo - fix
+        # todo - test with shade
+        temp = df[df["altitude"] == 0]
+        temp["altitude"] = 90
+        temp["value"] = df[df["altitude"] == 90]["value"].values[0]
+
+        temp2 = df[df["azimuth"] == 0]
+        temp2["azimuth"] = 360
+
+        df = pd.concat([df, temp, temp2])
+
+        if ax is None:
+            ax = plt.gca()
+
+        title = f"{self.location.source}\n{analysis_period_to_string(analysis_period)}"
+        ax.set_title(title)
+
+        ax.tricontourf(df["azimuth"], df["altitude"], df["value"], levels=20)
+        plt.tight_layout()
+
+        return ax
+
+    # endregion: PLOTTING METHODS

@@ -6,7 +6,40 @@ from typing import Sequence
 
 import numpy as np
 from ladybug.location import Location
+from ladybug_geometry.geometry3d import Vector3D
 from sklearn.neighbors import KDTree
+
+
+def vector3d_to_azimuth_altitude(vector: Vector3D | list[float]) -> tuple[float, float]:
+    """Convert a 3D vector to the azimuth and altitude.
+
+    Args:
+        vector (Vector3D | list[float]):
+            A 3D vector or a list of three numbers representing the vector.
+            If a list, it should be in the form [x, y, z].
+
+    Returns:
+        tuple[float, float]:
+            The azimuthal angle and altitude angle in degrees.
+    """
+    if isinstance(vector, Vector3D):
+        vector = vector.to_array()
+    if len(vector) != 3:
+        raise ValueError("The vector must be 3D.")
+    if not all(isinstance(coord, (int, float)) for coord in vector):
+        raise ValueError("The vector must be numeric.")
+    if vector[0] == 0 and vector[1] == 0 and vector[2] == 0:
+        raise ValueError("The vector must not be the zero vector.")
+    if vector[2] < 0:
+        raise ValueError("The vector must be in the upper hemisphere.")
+
+    vector = Vector3D(*vector).normalize()
+
+    # get the azimthal angle in degress from north
+    azimuth = angle_clockwise_from_north([vector.x, vector.y])
+    # get the altitude in degrees from the xy plane
+    altitude = np.degrees(np.arcsin(vector.z))
+    return float(azimuth), float(altitude)
 
 
 def great_circle_distance(location1: Location, location2: Location) -> float:
