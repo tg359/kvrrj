@@ -1,18 +1,21 @@
 import calendar
 import json
+import urllib
 import warnings
-from dataclasses import asdict, dataclass
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import pytz
+from honeybee.config import folders as hb_folders
 from ladybug.datatype.angle import WindDirection
 from ladybug.datatype.speed import WindSpeed
+from ladybug.dt import Date
 from ladybug.epw import EPW, AnalysisPeriod, Header, HourlyContinuousCollection
-from ladybug.windrose import WindRose
+from ladybug.sunpath import DateTime, Location
+from matplotlib import pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.cm import ScalarMappable
 from matplotlib.collections import PatchCollection
@@ -20,291 +23,560 @@ from matplotlib.colors import Colormap, ListedColormap
 from matplotlib.patches import Patch, Rectangle
 from matplotlib.ticker import PercentFormatter
 
-from kvrrj.util import wind_speed_at_height
-from kvrrj.viz.color import contrasting_color, to_hex
-
-from .geometry.util import (
+from kvrrj.geometry.util import (
     angle_clockwise_from_north,
     angle_to_vector,
     cardinality,
     circular_weighted_mean,
 )
-from .ladybug.analysis_period import (
-    analysis_period_to_datetimes,
-    analysis_period_to_string,
+from kvrrj.ladybug.analysisperiod import (
+    _analysis_period_to_string,
+    _iterable_datetimes_to_lb_analysis_period,
 )
+from kvrrj.ladybug.location import (
+    _all_timezones_same,
+    _is_datetime_location_aligned,
+    _is_location_time_zone_valid_for_location,
+    average_location,
+    get_timezone_str_from_location,
+    get_tzinfo_from_location,
+    get_utc_offset_from_location,
+)
+from kvrrj.util import (
+    _datetimes_span_at_least_1_year,
+    _is_iterable_1d,
+    _is_iterable_single_dtype,
+    _is_leap_year,
+    wind_speed_at_height,
+)
+from kvrrj.viz.color import contrasting_color, to_hex
 
-_DEFAULT_DIRECTION_COUNT = 8
-_DEFAULT_BIN_COUNT = 11
-_DEFAULT_CALM_THRESHOLD = 0.1
+from .logging import CONSOLE_LOGGER  # noqa: F401
 
 
-@dataclass(init=True, eq=True, repr=True)
+@dataclass
 class Wind:
-    """An object containing historic, time-indexed wind data.
+    """An object containing solar data.
 
     Args:
-        wind_speeds (list[int | float | np.number]):
-            An iterable of wind speeds in m/s.
-        wind_directions (list[int | float | np.number]):
-            An iterable of wind directions in degrees from North (with North at 0-degrees).
-        datetimes (Union[pd.DatetimeIndex, list[Union[datetime, np.datetime64, pd.Timestamp]]]):
+        location (Location):
+            A ladybug Location object.
+        datetimes (list[datetime]):
             An iterable of datetime-like objects.
-        height_above_ground (float, optional):
-            The height above ground (in m) where the input wind speeds and directions were
-            collected. Defaults to 10m.
-        source (str, optional):
-            A source string to describe where the input data comes from. Defaults to None.
+        wind_speed (list[float]):
+            A list of wind speeds, in m/s.
+        wind_direction (list[float]):
+            A list of wind directions, in degrees clockwise from north (at 0).
+
     """
 
-    wind_speeds: list[float]
-    wind_directions: list[float]
+    # NOTE - BE STRICT WITH THE TYPING!
+    # NOTE - Conversions happen in class methods.
+    # NOTE - Validation happens at instantiation.
+
+    location: Location
     datetimes: list[datetime]
+    wind_speed: list[float]
+    wind_direction: list[float]
     height_above_ground: float
-    source: str = None
 
     # region: DUNDER METHODS
 
     def __post_init__(self):
+        """Check for validation of the inputs."""
+
+        # location validation
+        if not isinstance(self.location, Location):
+            raise ValueError("location must be a ladybug Location object.")
+        if self.location.source is None:
+            warnings.warn(
+                'The source field of the Location input is None. This means that things are a bit ambiguous! A default value of "somewhere ... be more spceific!" has been added.'
+            )
+            self.location.source = "UnknownSource"
+        if not _is_location_time_zone_valid_for_location(self.location):
+            raise ValueError(
+                f"The time zone of the location ({self.location.time_zone}) does not match the time zone of the lat/lon ({self.location.latitude}, {self.location.longitude})."
+            )
+
+        # datetimes validation
+        if not _is_iterable_1d(self.datetimes):
+            raise ValueError("datetimes must be a 1D iterable.")
+        if not _is_iterable_single_dtype(self.datetimes, datetime):
+            raise ValueError("datetimes must be a list of datetime-like objects.")
+
+        # check datetime timezone awareness
+        location_tzinfo = get_tzinfo_from_location(self.location)
+        dts = []
+        for dt in self.datetimes:
+            if dt.tzinfo is None:
+                warnings.warn(
+                    "Timezone information is missing from datetimes. This will be obtained from the Location and added as a UTC offset to the datetimes."
+                )
+                dts.append(dt.replace(tzinfo=location_tzinfo))
+            else:
+                if not _is_datetime_location_aligned(dt, self.location):
+                    raise ValueError(
+                        "The datetimes' timezone must match the location's time_zone."
+                    )
+                dts.append(dt)
+
+        # check timezines are the same
+        if not _all_timezones_same([d.tzinfo for d in dts]):
+            raise ValueError(
+                "All datetimes must have the same timezone. This is not the case."
+            )
+        self.datetimes = dts
+
+        # wind data validation
+        array_names = [
+            "wind_speed",
+            "wind_direction",
+        ]
+        for name in array_names:
+            if len(getattr(self, name)) != len(self.datetimes):
+                raise ValueError(
+                    f"{name} must be the same length as datetimes. {len(getattr(self, name))} != {len(self.datetimes)}."
+                )
+            if not _is_iterable_1d(getattr(self, name)):
+                raise ValueError(f"{name} must be a 1D iterable.")
+            if not _is_iterable_single_dtype(
+                getattr(self, name), (int, float, np.float64)
+            ):
+                raise ValueError(f"{name} must be a list of numeric values.")
+            if any(np.isnan(getattr(self, name))):
+                raise ValueError(f"{name} cannot contain null values.")
+        if any(i < 0 for i in self.wind_speed):
+            raise ValueError("Wind speeds cannot be negative.")
+        if any(i < 0 or i > 360 for i in self.wind_direction):
+            raise ValueError("Wind directions must be between 0 and 360 degrees.")
+
+        # height above ground validation
+        if not isinstance(self.height_above_ground, (int, float)):
+            raise ValueError("height_above_ground must be a number.")
         if self.height_above_ground < 0.1:
-            raise ValueError("Height above ground must be >= 0.1m.")
-
-        if not isinstance(self.wind_speeds, list):
-            raise ValueError("wind_speeds must be a list.")
-        if not isinstance(self.wind_directions, list):
-            raise ValueError("wind_directions must be a list.")
-        if not isinstance(self.datetimes, list):
-            raise ValueError("datetimes must be a list.")
-
-        if (
-            not len(self.wind_speeds)
-            == len(self.wind_directions)
-            == len(self.datetimes)
-        ):
             raise ValueError(
-                "wind_speeds, wind_directions and datetimes must be the same length."
+                "height_above_ground must be greater than or equal to 0.1."
             )
-
-        if len(self.wind_speeds) <= 1:
-            raise ValueError(
-                "wind_speeds, wind_directions and datetimes must be at least 2 items long."
-            )
-
-        if len(set(self.datetimes)) != len(self.datetimes):
-            raise ValueError("datetimes contains duplicates.")
-
-        # validate wind speeds and directions
-        if np.any(np.isnan(self.wind_speeds)):
-            raise ValueError("wind_speeds contains null values.")
-
-        if np.any(np.isnan(self.wind_directions)):
-            raise ValueError("wind_directions contains null values.")
-
-        if np.any(np.array(self.wind_speeds) < 0):
-            raise ValueError("wind_speeds must be >= 0")
-        if np.any(np.array(self.wind_directions) < 0) or np.any(
-            np.array(self.wind_directions) > 360
-        ):
-            raise ValueError("wind_directions must be within 0-360")
-        self.wind_directions = [i % 360 for i in self.wind_directions]
 
     def __len__(self) -> int:
         return len(self.datetimes)
 
-    def __repr__(self) -> str:
-        """The printable representation of the given object"""
-        if self.source:
-            return f"{self.__class__.__name__}(@{self.height_above_ground}m) from {self.source}"
+    def __str__(self) -> str:
+        return f"{self.__class__.__name__} data from {self.location.source} (n={len(self)})"
 
-        return (
-            f"{self.__class__.__name__}({min(self.datetimes):%Y-%m-%d} to "
-            f"{max(self.datetimes):%Y-%m-%d}, n={len(self.datetimes)} @{self.freq}, "
-            f"@{self.height_above_ground}m) NO SOURCE"
+    def __repr__(self) -> str:
+        return str(self)
+
+    def __hash__(self) -> int:
+        return hash(
+            (
+                self.location,
+                tuple(self.datetimes),
+                tuple(self.wind_speed),
+                tuple(self.wind_direction),
+            )
         )
 
-    def __str__(self) -> str:
-        """The string representation of the given object"""
-        return self.__repr__()
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, Wind):
+            return False
+        return (
+            self.location == other.location
+            and self.datetimes == other.datetimes
+            and self.wind_speed == other.wind_speed
+            and self.wind_direction == other.wind_direction
+        )
 
     # endregion: DUNDER METHODS
 
-    # region: CLASS METHODS
+    # region: STATIC METHODS
 
-    def to_dict(self) -> dict:
-        """Return the object as a dictionary."""
-        d = asdict(self)
-        # d["_t"] = f"{self.__module__}.{self.__class__.__name__}"
-        return d
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "Wind":
-        """Create this object from a dictionary."""
-        return cls(**d)
-
-    def to_json(self) -> str:
-        """Convert this object to a JSON string."""
-        d = self.to_dict()
-        d["datetimes"] = [dt.isoformat() for dt in self.datetimes]
-        return json.dumps(d)
-
-    @classmethod
-    def from_json(cls, json_string: str) -> "Wind":
-        """Create this object from a JSON string."""
-        d = json.loads(json_string)
-        d["datetimes"] = [datetime.fromisoformat(dt) for dt in d["datetimes"]]
-        return cls.from_dict(d)
-
-    def to_json_file(self, path: Path) -> Path:
-        """Convert this object to a JSON file."""
-
-        if Path(path).suffix != ".json":
-            raise ValueError("path must be a JSON file.")
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        with open(Path(path), "w", encoding="utf-8") as fp:
-            fp.write(self.to_json())
-
-        return Path(path)
-
-    @classmethod
-    def from_json_file(cls, path: Path) -> "Wind":
-        """Create this object from a JSON file."""
-        with open(Path(path), "r", encoding="utf-8") as fp:
-            return cls.from_json(fp.read())
-
-    def to_csv_file(self, path: Path) -> Path:
-        """Save this object as a csv file.
+    @staticmethod
+    def _direction_midpoints(directions: int = 36) -> list[float]:
+        """Calculate the midpoints for a given number of directions.
 
         Args:
-            path (Path):
-                The path containing the CSV file.
+            directions (int):
+                The number of directions to calculate midpoints for.
 
         Returns:
-            Path:
-                The resultant CSV file.
+            list[float]:
+                A list of midpoints.
         """
-        if Path(path).suffix != ".csv":
-            raise ValueError("path must be a CSV file.")
-        path.parent.mkdir(parents=True, exist_ok=True)
+        if directions <= 2:
+            raise ValueError("directions must be > 2.")
+        return np.linspace(0, 360, directions + 1)[:-1].tolist()
 
-        csv_path = Path(path)
-        self.df.to_csv(csv_path)
-        return csv_path
-
-    @classmethod
-    def from_csv_file(
-        cls,
-        csv_path: Path,
-        wind_speed_column: str = None,
-        wind_direction_column: str = None,
-        height_above_ground: float = 10,
-        **kwargs,
-    ) -> "Wind":
-        """Create a Wind object from a csv containing wind speed and direction columns.
+    @staticmethod
+    def _direction_bins(
+        directions: int = 36,
+    ) -> list[tuple[float, float]]:
+        """Calculate the bin edges for a given number of directions.
 
         Args:
-            csv_path (Path):
-                The path to the CSV file containing speed and direction columns,
-                and a datetime index.
-            wind_speed_column (str):
-                The name of the column where wind-speed data exists.
-            wind_direction_column (str):
-                The name of the column where wind-direction data exists.
-            height_above_ground (float, optional):
-                Defaults to 10m.
-            **kwargs:
-                Additional keyword arguments passed to pd.read_csv.
+            directions (int):
+                The number of directions to calculate bin edges for.
+
+        Returns:
+            list[tuple[float, float]]:
+                A list of bin edges.
         """
-        csv_path = Path(csv_path)
-        df = pd.read_csv(csv_path, parse_dates=True, index_col=0, **kwargs)
-        return cls.from_dataframe(
-            df,
-            wind_speed_column=wind_speed_column,
-            wind_direction_column=wind_direction_column,
-            height_above_ground=height_above_ground,
-            source=csv_path.name,
+
+        edges = [
+            i + (360 / directions / 2) for i in Wind._direction_midpoints(directions)
+        ]
+        edges.insert(0, edges[-1])
+        return [
+            tuple(i)
+            for i in np.lib.stride_tricks.sliding_window_view(edges, 2).tolist()
+        ]
+
+    # endregion: STATIC METHODS
+
+    # region: PROPERTIES
+
+    @property
+    def dates(self) -> list[date]:
+        return sorted(list(set([dt.date() for dt in self.datetimes])))
+
+    @property
+    def start_date(self) -> date:
+        return min(self.dates)
+
+    @property
+    def end_date(self) -> date:
+        return max(self.dates)
+
+    @property
+    def lb_datetimes(self) -> list[date]:
+        return [
+            DateTime(
+                month=dt.month,
+                day=dt.day,
+                hour=dt.hour,
+                minute=dt.minute,
+                leap_year=_is_leap_year(dt.year),
+            )
+            for dt in self.datetimes
+        ]
+
+    @property
+    def lb_dates(self) -> list[Date]:
+        return [
+            Date(
+                month=d.month,
+                day=d.day,
+                leap_year=_is_leap_year(d.year),
+            )
+            for d in self.dates
+        ]
+
+    @property
+    def datetimeindex(self) -> pd.DatetimeIndex:
+        return pd.DatetimeIndex(self.datetimes)
+
+    @property
+    def wind_speed_series(self) -> pd.Series:
+        return pd.Series(
+            data=self.wind_speed,
+            index=self.datetimeindex,
+            name="Wind Speed (m/s)",
         )
 
-    def to_dataframe(self) -> pd.DataFrame:
-        """Return the object as a DataFrame."""
-        return pd.DataFrame(
-            {
-                "speed": self.wind_speeds,
-                "direction": self.wind_directions,
-            },
-            index=self.datetimes,
+    @property
+    def wind_speed_collection(self) -> HourlyContinuousCollection:
+        data = self.wind_speed_series
+        values = (
+            data.groupby([data.index.month, data.index.day, data.index.time])
+            .mean()
+            .values
+        ).tolist()
+        ap = self.analysis_period
+        header = Header(
+            data_type=WindSpeed(),
+            unit="m/s",
+            analysis_period=ap,
+            metadata={"source": self.location.source},
+        )
+        return HourlyContinuousCollection(header=header, values=values)
+
+    @property
+    def wind_direction_series(self) -> pd.Series:
+        return pd.Series(
+            data=self.wind_direction,
+            index=self.datetimeindex,
+            name="Wind Direction (degrees)",
         )
 
-    @classmethod
-    def from_dataframe(
-        cls,
-        df: pd.DataFrame,
-        wind_speed_column: Any = None,
-        wind_direction_column: Any = None,
-        height_above_ground: float = 10,
-        source: str = "DataFrame",
-    ) -> "Wind":
-        """Create a Wind object from a Pandas DataFrame, with speed and direction columns.
+    @property
+    def wind_direction_collection(self) -> HourlyContinuousCollection:
+        data = self.wind_direction_series
+        values = (
+            data.groupby([data.index.month, data.index.day, data.index.time])
+            .mean()
+            .values
+        ).tolist()
+        ap = self.analysis_period
+        header = Header(
+            data_type=WindDirection(),
+            unit="degrees",
+            analysis_period=ap,
+            metadata={"source": self.location.source},
+        )
+        return HourlyContinuousCollection(header=header, values=values)
+
+    @property
+    def df(self) -> pd.DataFrame:
+        return pd.concat(
+            [
+                self.wind_speed_series,
+                self.wind_direction_series,
+            ],
+            axis=1,
+        )
+
+    @property
+    def analysis_period(self) -> AnalysisPeriod:
+        idx = self.datetimeindex
+        data = pd.Series(index=idx, data=np.zeros_like(idx))
+        data = data.groupby([data.index.month, data.index.day, data.index.time]).mean()
+        midx = data.index
+        year = 2016 if [2, 29] in midx.to_frame(index=False)[[0, 1]].values else 2017
+        dts = (
+            pd.to_datetime(
+                [
+                    datetime(year, month, day, time.hour, time.minute, time.second)
+                    for month, day, time in midx
+                ]
+            )
+            .to_pydatetime()
+            .tolist()
+        )
+        return _iterable_datetimes_to_lb_analysis_period(dts)
+
+    @property
+    def freq(self) -> str:
+        """Return the inferred frequency of the datetimes associated with this object."""
+        freq = pd.infer_freq(self.datetimes)
+        if freq is None:
+            return "inconsistent"
+        return freq
+
+    @property
+    def pd_datetimeindex(self) -> pd.DatetimeIndex:
+        """Get the datetimes as a pandas DateTimeIndex."""
+        return pd.to_datetime(self.datetimes)
+
+    @property
+    def ws(self) -> pd.Series:
+        """Convenience accessor for wind speeds as a time-indexed pd.Series object."""
+        return pd.Series(
+            self.wind_speeds, index=self.index, name="Wind Speed (m/s)"
+        ).sort_index(ascending=True, inplace=False)
+
+    @property
+    def wd(self) -> pd.Series:
+        """Convenience accessor for wind directions as a time-indexed pd.Series object."""
+        return pd.Series(
+            self.wind_directions, index=self.index, name="Wind Direction (degrees)"
+        ).sort_index(ascending=True, inplace=False)
+
+    @property
+    def uv(self) -> list[tuple[float, float]]:
+        """Return the U and V wind components in m/s."""
+        return angle_to_vector(self.wd)
+
+    def mean_speed(self, include_zero: bool = True) -> float:
+        """Return the mean wind speed for this object.
 
         Args:
-            df (pd.DataFrame):
-                A DataFrame object containing speed and direction columns, and a datetime index.
-            wind_speed_column (str):
-                The name of the column where wind-speed data exists.
-            wind_direction_column (str):
-                The name of the column where wind-direction data exists.
-            height_above_ground (float, optional):
-                Defaults to 10m.
-            source (str, optional):
-                A source string to describe where the input data comes from.
-                Defaults to "DataFrame"".
+            include_zero (bool, optional):
+                If True, include calm wind speeds in the mean.
+                Defaults to True.
+
+        Returns:
+            float:
+                Mean wind speed.
+
         """
+        if include_zero:
+            return self.ws[self.ws > 0].mean()
+        return self.ws.mean()
 
-        if not isinstance(df, pd.DataFrame):
-            raise ValueError(f"df must be of type {type(pd.DataFrame)}")
+    @property
+    def mean_uv(self) -> list[float, float]:
+        """Calculate the average U and V wind components in m/s.
 
-        if not isinstance(df.index, pd.DatetimeIndex):
+        Returns:
+            list[float, float]:
+                A tuple containing the average U and V wind components.
+        """
+        return self.uv.mean().tolist()
+
+    @property
+    def mean_direction(self) -> tuple[float, float]:
+        """Calculate the average direction for this object."""
+        return angle_clockwise_from_north(self.mean_uv)
+
+    @property
+    def min_speed(self, include_zero: bool = False) -> float:
+        """Return the min wind speed for this object."""
+        if include_zero:
+            return self.ws.min()
+        return self.ws[self.ws > 0].min()
+
+    @property
+    def max_speed(self) -> float:
+        """Return the max wind speed for this object."""
+        return self.ws.max()
+
+    @property
+    def median_speed(self, include_zero: bool = False) -> float:
+        """Return the median wind speed for this object."""
+        if include_zero:
+            return self.ws.median()
+        return self.ws[self.ws > 0].median()
+
+    # endregion: PROPERTIES
+
+    # region: CLASS METHODS
+
+    @classmethod
+    def from_openmeteo(
+        cls,
+        location: Location,
+        start_date: str | date,
+        end_date: str | date,
+    ) -> "Wind":
+        """Query Open Meteo for wind data."""
+
+        if not isinstance(location, Location):
+            raise ValueError("location must be a ladybug Location object.")
+        if isinstance(start_date, str):
+            start_date = pd.to_datetime(start_date).to_pydatetime().date()
+        if isinstance(end_date, str):
+            end_date = pd.to_datetime(end_date).to_pydatetime().date()
+        if not isinstance(start_date, date):
+            raise ValueError("start_date must be a date object.")
+        if not isinstance(end_date, date):
+            raise ValueError("end_date must be a date object.")
+        if start_date > end_date:
+            raise ValueError("start_date must be less than end_date.")
+
+        # create the list of datetimes being queried
+        dates = [
+            i.date()
+            for i in pd.date_range(
+                start=start_date, end=end_date, freq="D", inclusive="both"
+            )
+        ]
+        _datetimes = pd.date_range(
+            start=start_date,
+            end=end_date + timedelta(days=1),
+            freq="h",
+            inclusive="both",
+        )[:-1]
+        if not _datetimes_span_at_least_1_year(_datetimes):
+            raise ValueError("The dates must span an entire year.")
+        if start_date.year == end_date.year:
+            # single year covered
+            if _is_leap_year(start_date.year):
+                # leap year
+                if len(dates) < 366:
+                    raise ValueError(
+                        "The requested date range must be at least a full year."
+                    )
+            else:
+                # non-leap year
+                if len(dates) < 365:
+                    raise ValueError(
+                        "The requested date range must be at least a full year."
+                    )
+
+        # get time zone from the location and check that it matches the location
+        time_zone_str = get_timezone_str_from_location(location)
+        time_zone_hours = get_utc_offset_from_location(location).seconds / 3600
+        if not _is_location_time_zone_valid_for_location(location):
             raise ValueError(
-                f"The DataFrame's index must be of type {type(pd.DatetimeIndex)}"
+                f"The time zone of the location ({location.time_zone}) does not match the time zone of the lat/lon ({time_zone_hours})."
             )
 
-        # remove NaN values
-        df.dropna(axis=0, how="any", inplace=True)
+        # modify the location so that its source is OpenMeteo ERA5
+        location = location.duplicate()
+        location.source = (
+            f"OpenMeteo ERA5 at {location.latitude}°, {location.longitude}°"
+        )
 
-        # remove duplicates in input dataframe
-        df = df.loc[~df.index.duplicated()]
+        # set the output directory
+        _dir = Path(hb_folders.default_simulation_folder) / "_lbt_tk_openmeteo"
+        _dir.mkdir(exist_ok=True, parents=True)
 
-        # if wind_speed_column and wind_direction_column are not provided, attempt to use some best-guesses
-        if wind_speed_column is None:
-            for col in ["wind_speed", "speed", "ws", "Wind Speed (m/s)"]:
-                if col in df.columns:
-                    wind_speed_column = col
-                    break
-            if wind_speed_column is None:
-                raise ValueError(
-                    "wind_speed_column not found in DataFrame. You'll need to provide a specific column index rather than relying on a best-guess."
-                )
-        if wind_direction_column is None:
-            for col in [
-                "wind_direction",
-                "direction",
-                "wd",
-                "Wind Direction (degrees)",
-            ]:
-                if col in df.columns:
-                    wind_direction_column = col
-                    break
-            if wind_direction_column is None:
-                raise ValueError(
-                    "wind_direction_column not found in DataFrame. You'll need to provide a specific column index rather than relying on a best-guess."
-                )
+        # variables to query
+        vars = [
+            {
+                "openmeteo_name": "winddirection_10m",
+                "openmeteo_unit": "°",
+                "target_name": "Wind Direction",
+                "target_unit": "degrees",
+                "target_multiplier": 1,
+            },
+            {
+                "openmeteo_name": "windspeed_10m",
+                "openmeteo_unit": "km/h",
+                "target_name": "Wind Speed",
+                "target_unit": "m/s",
+                "target_multiplier": 1 / 3.6,
+            },
+        ]
 
+        # create the savepath for the returned data
+        sp = (
+            _dir
+            / f"wind_{location.latitude}_{location.longitude}_{start_date:%Y%m%d}_{end_date:%Y%m%d}.json"
+        )
+        if sp.exists():
+            CONSOLE_LOGGER.info(f"Loading data from {sp.name}")
+            with open(sp, "r") as f:
+                data = json.load(f)
+        else:
+            # construct url query string
+            var_strings = ",".join([i["openmeteo_name"] for i in vars])
+            query_string = "".join(
+                [
+                    "https://archive-api.open-meteo.com/v1/era5",
+                    f"?latitude={location.latitude}",
+                    f"&longitude={location.longitude}",
+                    f"&timezone={time_zone_str}",
+                    f"&start_date={start_date:%Y-%m-%d}",
+                    f"&end_date={end_date:%Y-%m-%d}",
+                    f"&hourly={var_strings}",
+                ]
+            )
+
+            # query the data, and save to file
+            CONSOLE_LOGGER.info(f"Querying data from {query_string}")
+            with urllib.request.urlopen(query_string) as url:
+                data = json.load(url)
+            with open(sp, "w") as f:
+                json.dump(data, f)
+
+        # get the datetimes
+        datetimes: list[datetime] = (
+            pd.to_datetime(data["hourly"]["time"])
+            .tz_localize(pytz.FixedOffset(data["utc_offset_seconds"] / 60))
+            .to_pydatetime()
+            .tolist()
+        )
+        # get the wind speed
+        ws = [i * 1 / 3.6 for i in data["hourly"]["windspeed_10m"]]
+        # get the wind direction
+        wd = data["hourly"]["winddirection_10m"]
         return cls(
-            wind_speeds=df[wind_speed_column].tolist(),
-            wind_directions=df[wind_direction_column].tolist(),
-            datetimes=df.index.tolist(),
-            height_above_ground=height_above_ground,
-            source=source,
+            location=location,
+            datetimes=datetimes,
+            wind_speed=ws,
+            wind_direction=wd,
+            height_above_ground=10,
         )
 
     @classmethod
@@ -317,58 +589,179 @@ class Wind:
         """
 
         if isinstance(epw, (str, Path)):
-            source = Path(epw).name
             epw = EPW(epw)
-        else:
-            source = Path(epw.file_path).name
+
+        # modify location to state the EPW file in the source field
+        location = epw.location
+        location.source = f"{Path(epw.file_path).name}"
+
+        # obtain the datetimes
+        datetimes = pd.to_datetime(
+            epw.dry_bulb_temperature.header.analysis_period.datetimes
+        )
+        # add timezone information to the datetimes
+        datetimes = [
+            dt.replace(
+                tzinfo=timezone(timedelta(hours=epw.location.time_zone))
+            ).to_pydatetime()
+            for dt in datetimes
+        ]
 
         return cls(
-            wind_speeds=list(epw.wind_speed.values),
-            wind_directions=list(epw.wind_direction.values),
-            datetimes=analysis_period_to_datetimes(AnalysisPeriod()),
+            location=location,
+            datetimes=datetimes,
+            wind_speed=epw.wind_speed.values,
+            wind_direction=epw.wind_direction.values,
             height_above_ground=10,
-            source=source,
+        )
+
+    def to_dict(self) -> dict:
+        """Represent the object as a python-native dtype dictionary."""
+
+        return {
+            "type": "Wind",
+            "location": self.location.to_dict(),
+            "datetimes": [i.isoformat() for i in self.datetimes],
+            "wind_speed": self.wind_speed,
+            "wind_direction": self.wind_direction,
+            "height_above_ground": self.height_above_ground,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Wind":
+        """Create this object from a dictionary."""
+
+        if d.get("type", None) != "Wind":
+            raise ValueError("The dictionary cannot be converted Wind object.")
+
+        return cls(
+            location=Location.from_dict(d["location"]),
+            datetimes=pd.to_datetime(d["datetimes"]),
+            wind_speed=d["wind_speed"],
+            wind_direction=d["wind_direction"],  #
+            height_above_ground=d["height_above_ground"],
+        )
+
+    def to_json(self) -> str:
+        """Convert this object to a JSON string."""
+        return json.dumps(self.to_dict())
+
+    @classmethod
+    def from_json(cls, json_string: str) -> "Wind":
+        """Create this object from a JSON string."""
+        return cls.from_dict(json.loads(json_string))
+
+    @classmethod
+    def from_dataframe(
+        cls,
+        df: pd.DataFrame,
+        location: Location,
+        wind_speed_column: str = None,
+        wind_direction_column: str = None,
+        height_above_ground: float = 10,
+    ) -> "Wind":
+        """Create this object from a DataFrame.
+
+        Args:
+            df (pd.DataFrame):
+                A DataFrame object containing the solar data.
+            location (Location, optional):
+                A ladybug Location object. If not provided, the location data
+                will be extracted from the DataFrame if present.
+        """
+
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise ValueError("The DataFrame's index must be of type pd.DatetimeIndex.")
+        if not isinstance(location, Location):
+            raise ValueError("location must be a ladybug Location object.")
+
+        # get the columns from a best guess
+        if wind_speed_column is None:
+            for col in [
+                "wind_speed",
+                "speed",
+                "Wind Speed (m/s)",
+            ]:
+                if col in df.columns:
+                    wind_speed_column = col
+                    break
+            if wind_speed_column is None:
+                raise ValueError(
+                    "wind_speed_column not found in DataFrame. You'll need to provide a specific column label rather than relying on a best-guess."
+                )
+        if wind_direction_column is None:
+            for col in [
+                "wind_direction",
+                "direction",
+                "Wind Directions (degrees)",
+            ]:
+                if col in df.columns:
+                    wind_direction_column = col
+                    break
+            if wind_direction_column is None:
+                raise ValueError(
+                    "wind_direction_column not found in DataFrame. You'll need to provide a specific column label rather than relying on a best-guess."
+                )
+
+        return cls(
+            location=location,
+            datetimes=df.index.to_pydatetime().tolist(),
+            wind_speed=df[wind_speed_column].tolist(),
+            wind_direction=df[wind_direction_column].tolist(),
+            height_above_ground=height_above_ground,
         )
 
     @classmethod
-    def from_average(
-        cls, wind_objects: list["Wind"], weights: list[float] = None
-    ) -> "Wind":
+    def from_average(cls, objects: list["Wind"], weights: list[float] = None) -> "Wind":
         """Create an average Wind object from a set of input Wind objects, with optional weighting for each."""
+
+        # validation
+        if not _is_iterable_1d(objects):
+            raise ValueError("objects must be a 1D list of Wind objects.")
+        if not _is_iterable_single_dtype(objects, Wind):
+            raise ValueError("objects must be a list of Wind objects.")
+        if len(objects) == 0:
+            raise ValueError("objects cannot be empty.")
+        if len(objects) == 1:
+            return objects[0]
+
+        # check datetimes are the same
+        for obj in objects:
+            if obj.datetimes != objects[0].datetimes:
+                raise ValueError("All objects must share the same datetimes.")
 
         # create default weightings if None
         if weights is None:
-            weights = [1 / len(wind_objects)] * len(wind_objects)
+            weights = [1 / len(objects)] * len(objects)
         else:
             if sum(weights) != 1:
                 raise ValueError("weights must total 1.")
 
-        # create source string
-        source = []
-        for src, wgt in list(zip([wind_objects, weights])):
-            source.append(f"{src.source}|{wgt}")
-        source = "_".join(source)
+        # create average location
+        avg_location = average_location([i.location for i in objects], weights=weights)
 
         # align collections so that intersection only is created
-        df_ws = pd.concat([i.ws for i in wind_objects], axis=1).dropna()
-        df_wd = pd.concat([i.wd for i in wind_objects], axis=1).dropna()
+        df_ws = pd.concat([i.ws for i in objects], axis=1).dropna()
+        df_wd = pd.concat([i.wd for i in objects], axis=1).dropna()
 
         # construct the weighted means
         wd_avg = np.array(
             [circular_weighted_mean(i, weights) for _, i in df_wd.iterrows()]
         )
         ws_avg = np.average(df_ws, axis=1, weights=weights)
-        dts = df_ws.index
+
+        # construct the avg height above ground
+        avg_height_above_ground = np.average(
+            [i.height_above_ground for i in objects], weights=weights
+        )
 
         # return the new averaged object
         return cls(
             wind_speeds=ws_avg.tolist(),
             wind_directions=wd_avg.tolist(),
-            datetimes=dts,
-            height_above_ground=np.average(
-                [i.height_above_ground for i in wind_objects], weights=weights
-            ),
-            source=source,
+            datetimes=objects[0].datetimes,
+            height_above_ground=avg_height_above_ground,
+            location=avg_location,
         )
 
     @classmethod
@@ -376,9 +769,9 @@ class Wind:
         cls,
         u: list[float],
         v: list[float],
+        location: Location,
         datetimes: list[datetime],
         height_above_ground: float = 10,
-        source: str = None,
     ) -> "Wind":
         """Create a Wind object from a set of U, V wind components.
 
@@ -415,293 +808,14 @@ class Wind:
             wind_directions=wind_direction.tolist(),
             datetimes=datetimes,
             height_above_ground=height_above_ground,
-            source=source,
-        )
-
-    def to_lb_windrose(self, direction_count: int = 12) -> WindRose:
-        """Convert this object to a ladybug WindRose object.
-
-        Args:
-            direction_count (int, optional):
-                The number of directions to use in the wind rose. Defaults to 12.
-
-        Returns:
-            WindRose:
-                A ladybug WindRose object
-        """
-        # check that theobject covers a full year
-        return WindRose(
-            analysis_data_collection=self.ws_datacollection,
-            direction_data_collection=self.wd_datacollection,
-            direction_count=direction_count,
+            location=location,
         )
 
     # endregion: CLASS METHODS
 
-    # region: PROPERTIES
+    # region: INSTANCE METHODS
 
-    @property
-    def freq(self) -> str:
-        """Return the inferred frequency of the datetimes associated with this object."""
-        freq = pd.infer_freq(self.datetimes)
-        if freq is None:
-            return "inconsistent"
-        return freq
-
-    @property
-    def index(self) -> pd.DatetimeIndex:
-        """Get the datetimes as a pandas DateTimeIndex."""
-        return pd.to_datetime(self.datetimes)
-
-    @property
-    def ws(self) -> pd.Series:
-        """Convenience accessor for wind speeds as a time-indexed pd.Series object."""
-        return pd.Series(
-            self.wind_speeds, index=self.index, name="Wind Speed (m/s)"
-        ).sort_index(ascending=True, inplace=False)
-
-    @property
-    def ws_datacollection(self) -> HourlyContinuousCollection:
-        """Convert the wind speeds to a ladybug datacollection."""
-        # check if the datetimes are a single year of hourly data
-        if not self._is_single_year_hourly(self.datetimes):
-            raise ValueError(
-                "Wind data must be a single year of hourly data to be converted to a ladybug WindRose object."
-            )
-        # create the datacolection
-        col = HourlyContinuousCollection(
-            header=Header(
-                analysis_period=AnalysisPeriod(
-                    is_leap_year=True if len(self.datetimes) == 8784 else False
-                ),
-                data_type=WindSpeed(),
-                unit="m/s",
-                metadata={"source": self.source},
-            ),
-            values=self.wind_speeds,
-        )
-        return col
-
-    @property
-    def wd_datacollection(self) -> HourlyContinuousCollection:
-        """Convert the wind directions to a ladybug datacollection."""
-        # check if the datetimes are a single year of hourly data
-        if not self._is_single_year_hourly(self.datetimes):
-            raise ValueError(
-                "Wind data must be a single year of hourly data to be converted to a ladybug WindRose object."
-            )
-        # create the datacolection
-        col = HourlyContinuousCollection(
-            header=Header(
-                analysis_period=AnalysisPeriod(
-                    is_leap_year=True if len(self.datetimes) == 8784 else False
-                ),
-                data_type=WindDirection(),
-                unit="degrees",
-                metadata={"source": self.source},
-            ),
-            values=self.wind_directions,
-        )
-        return col
-
-    @property
-    def wd(self) -> pd.Series:
-        """Convenience accessor for wind directions as a time-indexed pd.Series object."""
-        return pd.Series(
-            self.wind_directions, index=self.index, name="Wind Direction (degrees)"
-        ).sort_index(ascending=True, inplace=False)
-
-    @property
-    def df(self) -> pd.DataFrame:
-        """Convenience accessor for wind direction and speed as a time-indexed
-        pd.DataFrame object."""
-        return self.to_dataframe()
-
-    @property
-    def calm_datetimes(self) -> list[datetime]:
-        """Return the datetimes where wind speed is < 0.1.
-
-        Returns:
-            list[datetime]:
-                "Calm" wind datetimes.
-        """
-        return self.ws[self.ws <= 0.1].index.tolist()  # pylint: disable=E1136
-
-    @property
-    def uv(self) -> pd.DataFrame:
-        """Return the U and V wind components in m/s."""
-        u, v = angle_to_vector(self.wd)
-        return pd.concat([u * self.ws, v * self.ws], axis=1, keys=["u", "v"])
-
-    @property
-    def mean_uv(self) -> list[float, float]:
-        """Calculate the average U and V wind components in m/s.
-
-        Returns:
-            list[float, float]:
-                A tuple containing the average U and V wind components.
-        """
-        return self.uv.mean().tolist()
-
-    def mean_speed(self, remove_calm: float = _DEFAULT_CALM_THRESHOLD) -> float:
-        """Return the mean wind speed for this object.
-
-        Args:
-            remove_calm (float, optional):
-                Remove calm wind speeds below a threshold value.
-                Defaults to 0.1, which removes any value below that speed.
-
-        Returns:
-            float:
-                Mean wind speed.
-
-        """
-        return np.linalg.norm(
-            self.filter_by_speed(min_speed=_DEFAULT_CALM_THRESHOLD).mean_uv
-        )
-
-    @property
-    def mean_direction(self) -> tuple[float, float]:
-        """Calculate the average direction for this object."""
-        return angle_clockwise_from_north(self.mean_uv)
-
-    @property
-    def min_speed(self) -> float:
-        """Return the min wind speed for this object."""
-        return self.ws.min()
-
-    @property
-    def max_speed(self) -> float:
-        """Return the max wind speed for this object."""
-        return self.ws.max()
-
-    @property
-    def median_speed(self) -> float:
-        """Return the median wind speed for this object."""
-        return self.ws.median()
-
-    # endregion: PROPERTIES
-
-    # region: STATIC METHODS
-    @staticmethod
-    def _contains_all_months(datetimes: list[datetime]) -> bool:
-        """Check if a list of datetimes cover all months.
-
-        Args:
-            datetimes (list[datetime]):
-                A list of datetime objects.
-
-        Returns:
-            bool:
-                True if all months are covered.
-        """
-
-        return len(set([dt.month for dt in datetimes])) == 12
-
-    @staticmethod
-    def _contains_all_hours(datetimes: list[datetime]) -> bool:
-        """Check if a list of datetimes cover all hours.
-
-        Args:
-            datetimes (list[datetime]):
-                A list of datetime objects.
-
-        Returns:
-            bool:
-                True if all hours are covered.
-        """
-        return len(set([dt.hour for dt in datetimes])) == 24
-
-    @staticmethod
-    def _contains_single_year(datetimes: list[datetime]) -> bool:
-        """Check if a list of datetimes cover a single year.
-
-        Args:
-            datetimes (list[datetime]):
-                A list of datetime objects.
-
-        Returns:
-            bool:
-                True if a single year is covered.
-        """
-        return len(set([dt.year for dt in datetimes])) == 1
-
-    @staticmethod
-    def _is_single_year_hourly(datetimes: list[datetime]) -> bool:
-        """Check if the datetimes are a single year of hourly data.
-
-        Args:
-            datetimes (list[datetime]):
-                A list of datetime objects.
-
-        Returns:
-            bool:
-                True if the datetimes are a single year of hourly data.
-        """
-
-        # check if the datetimes are hourly
-        if len(set(datetimes)) not in [8760, 8784]:
-            return False
-
-        # check if the datetimes are a single year
-        if not Wind._contains_single_year(datetimes):
-            return False
-
-        # check if the datetimes are hourly
-        if not Wind._contains_all_hours(datetimes):
-            return False
-
-        # check if frequency is hourly
-        if pd.infer_freq(datetimes) != "h":
-            return False
-
-        return True
-
-    @staticmethod
-    def _direction_midpoints(directions: int = _DEFAULT_DIRECTION_COUNT) -> list[float]:
-        """Calculate the midpoints for a given number of directions.
-
-        Args:
-            directions (int):
-                The number of directions to calculate midpoints for.
-
-        Returns:
-            list[float]:
-                A list of midpoints.
-        """
-        if directions <= 2:
-            raise ValueError("directions must be > 2.")
-        return np.linspace(0, 360, directions + 1)[:-1].tolist()
-
-    @staticmethod
-    def _direction_bins(
-        directions: int = _DEFAULT_DIRECTION_COUNT,
-    ) -> list[tuple[float, float]]:
-        """Calculate the bin edges for a given number of directions.
-
-        Args:
-            directions (int):
-                The number of directions to calculate bin edges for.
-
-        Returns:
-            list[tuple[float, float]]:
-                A list of bin edges.
-        """
-
-        edges = [
-            i + (360 / directions / 2) for i in Wind._direction_midpoints(directions)
-        ]
-        edges.insert(0, edges[-1])
-        return [
-            tuple(i)
-            for i in np.lib.stride_tricks.sliding_window_view(edges, 2).tolist()
-        ]
-
-    # endregion: STATIC METHODS
-
-    # region: METHODS
-
-    def calm(self, threshold: float = _DEFAULT_CALM_THRESHOLD) -> float:
+    def calm(self, threshold: float = 0.1) -> float:
         """Return the proportion of timesteps "calm" (i.e. less than or equal
         to the threshold).
 
@@ -760,10 +874,10 @@ class Wind:
         )
         return Wind(
             wind_speeds=ws.tolist(),
-            wind_directions=self.wind_directions,
+            wind_directions=self.wind_direction,
             datetimes=self.datetimes,
             height_above_ground=target_height,
-            source=f"{self.source} translated to {target_height}m",
+            source=f"{self.location.source} translated to {target_height}m",
         )
 
     def apply_directional_factors(
@@ -808,8 +922,8 @@ class Wind:
         mapped_factors = [*map(factor_lookup.get, binned_directions)]
 
         return Wind(
-            wind_speeds=(np.array(mapped_factors) * self.wind_speeds).tolist(),
-            wind_directions=self.wind_directions,
+            wind_speed=(np.array(mapped_factors) * self.wind_speed).tolist(),
+            wind_direction=self.wind_direction,
             datetimes=self.datetimes,
             height_above_ground=self.height_above_ground,
             source=f"{self.source} (adjusted by factors {factor_lookup})",
@@ -817,7 +931,7 @@ class Wind:
 
     def prevailing(
         self,
-        directions: int = _DEFAULT_DIRECTION_COUNT,
+        directions: int = 36,
         n: int = 1,
         as_cardinal: bool = False,
     ) -> tuple[float] | tuple[str]:
@@ -870,32 +984,22 @@ class Wind:
         """
 
         # ensure data is suitable for matrixisation
-        if not all(
-            [
-                self._contains_all_hours(self.datetimes),
-                self._contains_all_months(self.datetimes),
-                len(self) >= 8760,
-            ]
-        ):
-            raise ValueError(
-                "Wind object must contain at least 1 value per-hour, per-month to create a matrix."
-            )
 
         if other_data is None:
-            other_data = self.wind_speeds
+            other_data = self.wind_speed
 
         if len(other_data) != len(self):
             raise ValueError("other_data must be the same length as the wind data.")
 
         # convert other data to a series
-        other_data = pd.Series(other_data, index=self.index)
+        other_data = pd.Series(other_data, index=self.datetimeindex)
 
         # get the average wind direction per-hour, per-month
         wind_directions = (
             (
                 (
                     self.wd.groupby(
-                        [self.wd.index.month, self.wd.index.hour], axis=0
+                        [self.datetimeindex, self.datetimeindex], axis=0
                     ).apply(circular_weighted_mean)
                 )
                 % 360
@@ -923,45 +1027,8 @@ class Wind:
 
     # region: SAMPLING
 
-    def resample(self, rule: pd.DateOffset | pd.Timedelta | str) -> "Wind":
-        """Resample the wind data collection to a different timestep.
-        This can only be used to downsample.
-
-        Args:
-            rule (Union[pd.DateOffset, pd.Timedelta, str]):
-                A rule for resampling. This uses the same inputs as a Pandas
-                Series.resample() method.
-
-        Returns:
-            Wind:
-                A wind data collection object!
-        """
-
-        warnings.warn(
-            (
-                "Resampling wind speeds and direction is generally not advisable. "
-                "When input directions are opposing, the average returned will be inaccurate, "
-                "and the resultant speed does not include any outliers. USE WITH CAUTION!"
-            )
-        )
-
-        resampled_speeds = self.ws.resample(rule).mean()
-        if np.isnan(resampled_speeds).any():
-            raise ValueError("Resampling can only be used to downsample.")
-
-        resampled_directions = self.wd.resample(rule).apply(circular_weighted_mean)
-        resampled_datetimes = resampled_speeds.index
-
-        return Wind(
-            wind_speeds=resampled_speeds.tolist(),
-            wind_directions=resampled_directions.tolist(),
-            datetimes=resampled_datetimes.tolist(),
-            height_above_ground=self.height_above_ground,
-            source=f"{self.source} (resampled to {rule})",
-        )
-
     def _bin_direction_data(
-        self, directions: int = _DEFAULT_DIRECTION_COUNT, right: bool = True
+        self, directions: int = 36, right: bool = True
     ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
         """Bin the wind direction data into a set of directions.
 
@@ -997,7 +1064,7 @@ class Wind:
     def _bin_other_data(
         self,
         other_data: list[float] = None,
-        other_bins: list[float] | int = _DEFAULT_BIN_COUNT,
+        other_bins: list[float] | int = 11,
         right: bool = True,
     ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
         """Bin the "other" data into a set of bins.
@@ -1048,9 +1115,9 @@ class Wind:
 
     def histogram(
         self,
-        directions: int = _DEFAULT_DIRECTION_COUNT,
+        directions: int = 36,
         other_data: list[float] = None,
-        other_bins: list[float] | int = _DEFAULT_BIN_COUNT,
+        other_bins: list[float] | int = 11,
         density: bool = False,
         directions_right: bool = True,
         other_right: bool = True,
@@ -1144,15 +1211,12 @@ class Wind:
                 A dataset describing historic wind speed and direction relationship.
         """
 
-        if len(mask) != len(self.ws):
+        if len(mask) != len(self):
             raise ValueError(
                 "The length of the boolean mask must match the length of the current object."
             )
 
-        if sum(mask) == len(self.ws):
-            return self
-
-        if len(self.ws.values[mask]) == 0:
+        if sum(mask) == 0:
             raise ValueError("No data remains within the given boolean filters.")
 
         if source is None:
@@ -1181,9 +1245,7 @@ class Wind:
                 A dataset describing historic wind speed and direction relationship.
         """
 
-        possible_datetimes = pd.to_datetime(
-            analysis_period_to_datetimes(analysis_period)
-        )
+        possible_datetimes = pd.to_datetime(analysis_period.datetimes)
         lookup = pd.DataFrame(
             {
                 "month": possible_datetimes.month,
@@ -1203,7 +1265,7 @@ class Wind:
 
         return self.filter_by_boolean_mask(
             mask,
-            source=f"{self.source} (filtered to {analysis_period_to_string(analysis_period)})",
+            source=f"{self.source} (filtered to {_analysis_period_to_string(analysis_period)})",
         )
 
     def filter_by_time(
@@ -1415,7 +1477,7 @@ class Wind:
 
     # endregion: FILTERING
 
-    # endregion: METHODS
+    # endregion: INSTANCE METHODS
 
     # region: VIZUALIZATION
 
@@ -1533,9 +1595,9 @@ class Wind:
     def plot_windrose(
         self,
         ax: plt.Axes = None,
-        directions: int = _DEFAULT_DIRECTION_COUNT,
+        directions: int = 36,
         other_data: list[float] = None,
-        other_bins: list[float] = _DEFAULT_BIN_COUNT,
+        other_bins: list[float] = 11,
         show_legend: bool = True,
         show_label: bool = False,
         **kwargs,

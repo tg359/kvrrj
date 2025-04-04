@@ -3,7 +3,7 @@
 import logging
 import sys
 
-logging.captureWarnings(True)
+# logging.captureWarnings(True)
 # todo - fix warnings not being shown in console through CONSOLE_LOGGER
 # get current module name
 TOOLKIT_NAME = __name__.split(".")[0]

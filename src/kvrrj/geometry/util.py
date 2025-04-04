@@ -6,7 +6,7 @@ from typing import Sequence
 
 import numpy as np
 from ladybug.location import Location
-from ladybug_geometry.geometry3d import Vector3D
+from ladybug_geometry.geometry3d import Face3D, LineSegment3D, Mesh3D, Point3D, Vector3D
 from sklearn.neighbors import KDTree
 
 
@@ -405,3 +405,32 @@ def point_group(points: list[list[float]], threshold: float) -> list[list[float]
         clusters.append([points[i] for i in points_indices])
 
     return clusters
+
+
+def _create_azimuth_mesh(directions: int = 36, tilt_angle: float = 0) -> Mesh3D:
+    """Create a mesh of faces for a given number of directions and tilt angle.
+
+    This is used to creation the radiation rose, with one face per direction.
+
+    Args:
+        directions (int, optional):
+            The number of directions to divide the rose into.
+            Default is 36.
+        tilt_angle (float, optional):
+            The tilt angle in degrees from horizontal. 0 is horizontal, 90 is upwards.
+            Default is 0.
+
+    Returns:
+        Mesh3D:
+            A ladybug Mesh3D object
+    """
+
+    angles = np.linspace(0, 360, directions, endpoint=False)
+    base_face = Face3D.from_extrusion(
+        line_segment=LineSegment3D(p=Point3D(0.05, 0.1, 0), v=Vector3D(-0.1, 0, 0)),
+        extrusion_vector=Vector3D(0, 0, 0.1),
+    ).rotate(axis=Vector3D(1, 0, 0), angle=np.deg2rad(tilt_angle), origin=Point3D())
+    faces = [
+        base_face.rotate_xy(angle=np.deg2rad(-a), origin=Point3D()) for a in angles
+    ]
+    return Mesh3D.from_face_vertices(faces=faces)

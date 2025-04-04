@@ -117,7 +117,7 @@ from ladybug.datatype.volumeflowrateintensity import VolumeFlowRateIntensity
 from matplotlib.colors import Colormap, ListedColormap
 
 
-def datatype_to_string(datatype: DataTypeBase, unit: str) -> str:
+def to_string(datatype: DataTypeBase, unit: str) -> str:
     """Convert a ladybug datatype to a string representation.
 
     Args:
@@ -134,7 +134,7 @@ def datatype_to_string(datatype: DataTypeBase, unit: str) -> str:
     return f"{datatype} ({unit})"
 
 
-def datatype_from_string(text: str) -> DataTypeBase:
+def to_datatype(text: str) -> DataTypeBase:
     """Convert a string to a ladybug datatype."""
 
     str_elements = text.split(" ")
@@ -157,7 +157,7 @@ def datatype_from_string(text: str) -> DataTypeBase:
         return GenericType(name=data_type, unit=unit)
 
 
-def datatype_to_color(datatype: DataTypeBase) -> str:
+def to_color(datatype: DataTypeBase) -> str:
     """Convert a ladybug datatype to a color.
 
     Args:
@@ -281,7 +281,7 @@ def datatype_to_color(datatype: DataTypeBase) -> str:
         raise ValueError(f"Colormap not defined for datatype {datatype}.")
 
 
-def datatype_to_colormap(datatype: DataTypeBase) -> Colormap:
+def to_colormap(datatype: DataTypeBase) -> Colormap:
     """Convert a ladybug datatype to a colormap."""
 
     # TODO - SET CORRECT COLORS
@@ -528,3 +528,6 @@ def datatype_to_colormap(datatype: DataTypeBase) -> Colormap:
         return colormap_lookup[datatype]
     except KeyError:
         raise ValueError(f"Colormap not defined for datatype {datatype}.")
+
+
+# TODO -= update wind and solar methods!

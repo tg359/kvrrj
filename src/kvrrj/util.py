@@ -1,6 +1,90 @@
+import inspect
 import warnings
+from typing import Any, Iterable
 
 import numpy as np
+
+
+def _get_allowable_kwargs(obj: Any) -> list[str]:
+    """Attempt to obtain kwargs from a callable object."""
+    # Check if the object is callable and has a signature
+    if not callable(obj) or not hasattr(obj, "__signature__"):
+        raise ValueError("Object must be callable with a signature.")
+    kws = list(inspect.signature(obj).parameters)
+    if len(kws) == 0:
+        raise ValueError("No kwargs found for obj.")
+    return kws
+
+
+def _filter_kwargs_by_allowable(
+    kwargs: dict[str, Any], allowable_kwargs: list[str]
+) -> dict[str, Any]:
+    """Filter a dictionary to return only allowable kwargs."""
+    return {k: v for k, v in kwargs.items() if k in allowable_kwargs}
+
+
+def _are_iterables_same_length(*args: Iterable[Any]) -> bool:
+    """Check if all lists have the same length."""
+    return all(len(arg) == len(args[0]) for arg in args)
+
+
+def _is_iterable_single_dtype(arg: Iterable[Any], dtype: Any) -> bool:
+    """Check if all items in an iterable have the same type."""
+    return all(isinstance(i, dtype) for i in arg)
+
+
+def _is_iterable_1d(arg: Iterable[Any]) -> bool:
+    """Check if an iterable is 1D."""
+    return not any(hasattr(i, "__iter__") for i in arg)
+
+
+def _is_leap_year(year: int) -> bool:
+    """Check if a year is a leap year."""
+    if year % 4 == 0:
+        if year % 100 == 0:
+            if year % 400 == 0:
+                return True
+            return False
+        return True
+    return False
+
+
+def _datetimes_contain_all_months(datetimes: Iterable[Any]) -> bool:
+    """Check if datetimes are in each month of the year."""
+
+    if len(set([i.month for i in datetimes])) < 12:
+        return False
+    return True
+
+
+def _datetimes_contain_all_days(datetimes: Iterable[Any]) -> bool:
+    """Check if datetimes are in each day of the year."""
+
+    if len(set([i.day for i in datetimes])) < 31:
+        return False
+    return True
+
+
+def _datetimes_contain_all_hours(datetimes: Iterable[Any]) -> bool:
+    """Check if datetimes are in each hour of the year."""
+
+    if len(set([i.hour for i in datetimes])) < 24:
+        return False
+    return True
+
+
+def _datetimes_span_at_least_1_year(datetimes: Iterable[Any]) -> bool:
+    """Check if datetimes span an entire year."""
+
+    if not all(
+        [
+            _datetimes_contain_all_months(datetimes),
+            _datetimes_contain_all_days(datetimes),
+            _datetimes_contain_all_hours(datetimes),
+        ]
+    ):
+        return False
+    return True
 
 
 def wind_speed_at_height(
