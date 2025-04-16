@@ -79,12 +79,26 @@ def _polygon_to_shapely(obj: Polygon2D) -> Polygon:
     )
 
 
-def _mesh_to_shapely(obj: Mesh2D) -> MultiPolygon:
+def _mesh2d_to_shapely(obj: Mesh2D) -> MultiPolygon:
     if not isinstance(obj, Mesh2D):
         raise TypeError(f"Expected Mesh2D, got {type(obj)}")
     polylines: list[Polyline2D] = obj.face_edges
     polygons = [Polygon2D(polyline.vertices) for polyline in polylines]
     return MultiPolygon([_polygon_to_shapely(poly) for poly in polygons])
+
+
+def mesh2d_to_patchcollection(mesh: Mesh2D) -> list[Mesh2D]:
+    """Convert a Mesh2D to a list of patches.
+
+    Args:
+        mesh (Mesh2D):
+            A ladybug-geometry Mesh2D object.
+
+    Returns:
+        list[Mesh2D]: A list of ladybug-geometry Mesh2D objects.
+    """
+    raise NotImplementedError()
+    return [mesh]
 
 
 def _to_shapely_2d(obj: LB_GEOMETRY_2D) -> SHAPELY_GEOMETRY_2D:
@@ -101,5 +115,5 @@ def _to_shapely_2d(obj: LB_GEOMETRY_2D) -> SHAPELY_GEOMETRY_2D:
     if isinstance(obj, Polygon2D):
         return _polygon_to_shapely(obj)
     if isinstance(obj, Mesh2D):
-        return _mesh_to_shapely(obj)
+        return _mesh2d_to_shapely(obj)
     raise ValueError(f"Unsupported geometry type: {type(obj)}")

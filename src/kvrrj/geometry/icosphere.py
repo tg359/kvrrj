@@ -3,7 +3,7 @@ from math import acos, cos, sin
 from ladybug_geometry.geometry3d import Mesh3D, Point3D, Vector3D
 
 
-def create_icosphere(resolution: int = 1) -> Mesh3D:
+def icosphere(resolution: int = 1) -> Mesh3D:
     """Create an icosphere mesh with the given resolution.
 
     Args:

@@ -2,8 +2,6 @@ import inspect
 import warnings
 from typing import Any, Iterable
 
-import numpy as np
-
 
 def _get_allowable_kwargs(obj: Any) -> list[str]:
     """Attempt to obtain kwargs from a callable object."""
@@ -49,30 +47,6 @@ def _is_leap_year(year: int) -> bool:
     return False
 
 
-def _datetimes_contain_all_months(datetimes: Iterable[Any]) -> bool:
-    """Check if datetimes are in each month of the year."""
-
-    if len(set([i.month for i in datetimes])) < 12:
-        return False
-    return True
-
-
-def _datetimes_contain_all_days(datetimes: Iterable[Any]) -> bool:
-    """Check if datetimes are in each day of the year."""
-
-    if len(set([i.day for i in datetimes])) < 31:
-        return False
-    return True
-
-
-def _datetimes_contain_all_hours(datetimes: Iterable[Any]) -> bool:
-    """Check if datetimes are in each hour of the year."""
-
-    if len(set([i.hour for i in datetimes])) < 24:
-        return False
-    return True
-
-
 def _datetimes_span_at_least_1_year(datetimes: Iterable[Any]) -> bool:
     """Check if datetimes span an entire year."""
 
@@ -85,76 +59,6 @@ def _datetimes_span_at_least_1_year(datetimes: Iterable[Any]) -> bool:
     ):
         return False
     return True
-
-
-def wind_speed_at_height(
-    reference_value: float,
-    reference_height: float,
-    target_height: float,
-    **kwargs,
-) -> float:
-    """Calculate the wind speed at a given height from the 10m default height
-        as stated in an EPW file.
-
-    Args:
-        reference_value (float):
-            The speed to be translated.
-        reference_height (float):
-            The original height of the wind speed being translated.
-        target_height (float):
-            The target height of the wind speed being translated.
-
-        **kwargs:
-            Additional keyword arguments to pass to the translation method. These include:
-            terrain_roughness_length (float):
-                A value describing how rough the ground is. Default is
-                0.03 for Open flat terrain; grass, few isolated obstacles.
-            log_function (bool, optional):
-                Set to True to used the log transformation method, or
-                False for the exponent method. Defaults to True.
-
-    Notes:
-        Terrain roughness lengths can be found in the following table:
-
-        +---------------------------------------------------+-----------+
-        | Terrain description                               |  z0 (m)   |
-        +===================================================+===========+
-        | Open sea, Fetch at least 5 km                     |    0.0002 |
-        +---------------------------------------------------+-----------+
-        | Mud flats, snow; no vegetation, no obstacles      |    0.005  |
-        +---------------------------------------------------+-----------+
-        | Open flat terrain; grass, few isolated obstacle   |    0.03   |
-        +---------------------------------------------------+-----------+
-        | Low crops; occasional large obstacles, x/H > 20   |    0.10   |
-        +---------------------------------------------------+-----------+
-        | High crops; scattered obstacles, 15 < x/H < 20    |    0.25   |
-        +---------------------------------------------------+-----------+
-        | Parkland, bushes; numerous obstacles, x/H ≈ 10    |    0.5    |
-        +---------------------------------------------------+-----------+
-        | Regular large obstacle coverage (suburb, forest)  |    1.0    |
-        +---------------------------------------------------+-----------+
-        | City centre with high- and low-rise buildings     |    ≥ 2    |
-        +---------------------------------------------------+-----------+
-
-
-    Returns:
-        float:
-            The translated wind speed at the target height.
-    """
-
-    terrain_roughness_length = kwargs.get("terrain_roughness_length", 0.03)
-    log_function = kwargs.get("log_function", True)
-    kwargs = {}  # reset kwargs to remove invalid arguments
-
-    if log_function:
-        return reference_value * (
-            np.log(target_height / terrain_roughness_length)
-            / np.log(reference_height / terrain_roughness_length)
-        )
-    wind_shear_exponent = 1 / 7
-    return reference_value * (
-        np.power((target_height / reference_height), wind_shear_exponent)
-    )
 
 
 def temperature_at_height(

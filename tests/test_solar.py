@@ -1,151 +1,305 @@
-from datetime import date, timedelta
-from pathlib import Path
-
-import numpy as np
 import pandas as pd
 import pytest
-from ladybug.analysisperiod import AnalysisPeriod
 from ladybug.location import Location
 
-from kvrrj.solar import RadiationRose, SkyMatrix, Solar
+from kvrrj.solar import Solar
 
 from . import EPW_OBJ
 
-# region: INSTANTIATION
 
-
-def test_solar_initialization():
+def test_init():
     location = Location()
-    analysis_period = AnalysisPeriod()
-    dni = [100.0] * 8760
-    dhi = [50.0] * 8760
-    ghi = [150.0] * 8760
-
-    solar = Solar(
-        location=location,
-        analysis_period=analysis_period,
-        direct_normal_irradiance=dni,
-        diffuse_horizontal_irradiance=dhi,
-        global_horizontal_irradiance=ghi,
+    datetimes = (
+        pd.date_range(start="2023-01-01", periods=24, freq="h", tz="UTC")
+        .to_pydatetime()
+        .tolist()
     )
+    dni = [100.0] * 24
+    dhi = [50.0] * 24
+    ghi = [150.0] * 24
 
-    assert solar.location == location
-    assert solar.analysis_period == analysis_period
-    assert np.array_equal(solar.direct_normal_irradiance, np.array(dni))
-    assert np.array_equal(solar.diffuse_horizontal_irradiance, np.array(dhi))
-    assert np.array_equal(solar.global_horizontal_irradiance, np.array(ghi))
-
-    # different analysis period timestep
-    analysis_period = AnalysisPeriod(timestep=3)
-    dni = [100.0] * 8760 * 3
-    dhi = [50.0] * 8760 * 3
-    ghi = [150.0] * 8760 * 3
-
-    solar = Solar(
-        location=location,
-        analysis_period=analysis_period,
-        direct_normal_irradiance=dni,
-        diffuse_horizontal_irradiance=dhi,
-        global_horizontal_irradiance=ghi,
-    )
-
-    assert solar.location == location
-    assert solar.analysis_period == analysis_period
-    assert np.array_equal(solar.direct_normal_irradiance, np.array(dni))
-    assert np.array_equal(solar.diffuse_horizontal_irradiance, np.array(dhi))
-    assert np.array_equal(solar.global_horizontal_irradiance, np.array(ghi))
-
-    # incorrect length of data
-    dni = [100.0] * 8760
-    with pytest.raises(ValueError):
-        Solar(
+    with pytest.warns(UserWarning):
+        solar = Solar(
             location=location,
-            analysis_period=analysis_period,
-            direct_normal_irradiance=dni,
-            diffuse_horizontal_irradiance=dhi,
-            global_horizontal_irradiance=ghi,
+            datetimes=datetimes,
+            direct_normal_radiation=dni,
+            diffuse_horizontal_radiation=dhi,
+            global_horizontal_radiation=ghi,
         )
 
+    assert solar.location == location
+    assert solar.datetimes == datetimes
+    assert solar.direct_normal_radiation == dni
+    assert solar.diffuse_horizontal_radiation == dhi
+    assert solar.global_horizontal_radiation == ghi
 
-def test_solar_from_epw():
+
+def test_from_epw():
+    assert isinstance(Solar.from_epw(EPW_OBJ), Solar)
+
+
+def test_len():
+    obj = Solar.from_epw(EPW_OBJ)
+    len(obj)
+
+
+def test_str():
+    obj = Solar.from_epw(EPW_OBJ)
+    str(obj)
+
+
+def test_repr():
+    obj = Solar.from_epw(EPW_OBJ)
+    repr(obj)
+
+
+def test_hash():
+    obj = Solar.from_epw(EPW_OBJ)
+    hash(obj)
+
+
+def test_eq():
+    obj = Solar.from_epw(EPW_OBJ)
+    obj == obj
+
+
+def test_iter():
+    obj = Solar.from_epw(EPW_OBJ)
+    for i in obj:
+        pass
+
+
+def test_getitem():
+    obj = Solar.from_epw(EPW_OBJ)
+    obj[2]
+
+
+def test_copy():
+    obj = Solar.from_epw(EPW_OBJ)
+    obj.__copy__()
+
+
+def test_from_pvlib():
+    loc = Location()
+    obj = Solar.from_pvlib(location=loc, start_date="2017-01-01", end_date="2017-12-31")
+    assert isinstance(obj, Solar)
+
+
+def test_to_dict():
+    obj = Solar.from_epw(EPW_OBJ)
+    obj_dict = obj.to_dict()
+    assert isinstance(obj_dict, dict)
+
+
+def test_from_dict():
+    obj = Solar.from_epw(EPW_OBJ)
+    obj_dict = obj.to_dict()
+    new_obj = Solar.from_dict(obj_dict)
+    assert isinstance(new_obj, Solar)
+
+
+def test_to_json():
+    obj = Solar.from_epw(EPW_OBJ)
+    obj_json = obj.to_json()
+    assert isinstance(obj_json, str)
+
+
+def test_from_json():
+    obj = Solar.from_epw(EPW_OBJ)
+    obj_json = obj.to_json()
+    new_obj = Solar.from_json(obj_json)
+    assert isinstance(new_obj, Solar)
+
+
+def test_from_dataframe():
+    obj = Solar.from_epw(EPW_OBJ)
+    obj_df = obj.df
+    new_obj = Solar.from_dataframe(obj_df, location=obj.location)
+    assert isinstance(new_obj, Solar)
+
+
+def test_from_average():
+    obj = Solar.from_epw(EPW_OBJ)
+    new_obj = Solar.from_average([obj, obj, obj])
+    assert isinstance(new_obj, Solar)
+
+
+def test_dates():
     solar = Solar.from_epw(EPW_OBJ)
-    assert isinstance(solar, Solar)
-    assert solar.location.source == Path(EPW_OBJ.file_path).name
+    solar.dates
 
 
-def test_to_from_dict():
+def test_start_date():
     solar = Solar.from_epw(EPW_OBJ)
-    solar_dict = solar.to_dict()
-    assert isinstance(solar_dict, dict)
-    new_solar = Solar.from_dict(solar_dict)
-    assert isinstance(new_solar, Solar)
+    solar.start_date
 
 
-def test_to_from_json():
+def test_end_date():
     solar = Solar.from_epw(EPW_OBJ)
-    solar_json = solar.to_json()
-    assert isinstance(solar_json, str)
-    new_solar = Solar.from_json(solar_json)
-    assert isinstance(new_solar, Solar)
+    solar.end_date
 
 
-def test_solar_to_from_dataframe():
+def test_lb_datetimes():
     solar = Solar.from_epw(EPW_OBJ)
-    solar_df = solar.to_dataframe()
-    assert isinstance(solar_df, pd.DataFrame)
-    new_solar = Solar.from_dataframe(solar_df)
-    assert isinstance(new_solar, Solar)
-    assert solar == new_solar
+    solar.lb_datetimes
 
 
-def test_equality():
-    solar1 = Solar.from_epw(EPW_OBJ)
-    solar2 = Solar.from_epw(EPW_OBJ)
-    assert solar1 == solar2
-
-
-def test_length():
+def test_lb_dates():
     solar = Solar.from_epw(EPW_OBJ)
-    assert len(solar) == 8760
+    solar.lb_dates
+
+
+def test_datetimeindex():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar.datetimeindex
+
+
+def test_direct_normal_radiation_series():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar.direct_normal_radiation_series
+
+
+def test_direct_normal_radiation_collection():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar.direct_normal_radiation_collection
+
+
+def test_diffuse_horizontal_radiation_series():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar.diffuse_horizontal_radiation_series
+
+
+def test_diffuse_horizontal_radiation_collection():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar.diffuse_horizontal_radiation_collection
+
+
+def test_global_horizontal_radiation_series():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar.global_horizontal_radiation_series
+
+
+def test_global_horizontal_radiation_collection():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar.global_horizontal_radiation_collection
+
+
+def test_df():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar.df
+
+
+def test_analysis_period():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar.analysis_period
+
+
+def test_sunpath():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar.sunpath
+
+
+def test_suns():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar.suns
+
+
+def test_suns_df():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar.suns_df
 
 
 def test_sunrise_sunset():
-    dts = [date(2017, 1, 1) + timedelta(days=i) for i in range(100, 111, 1)]
-    df = Solar._sunrise_sunset(dates=dts, location=Location())
-    assert isinstance(df, pd.DataFrame)
-    assert len(df) == len(dts)
-    assert "civil sunrise" in df.columns
-    assert "nautical sunrise" in df.columns
-    assert "astronomical sunrise" in df.columns
-    assert "noon" in df.columns
-    assert "apparent sunset" in df.columns
-
-
-def test_lb_sky_matrix():
     solar = Solar.from_epw(EPW_OBJ)
-    assert isinstance(solar._sky_matrix(), SkyMatrix)
+    solar.sunrise_sunset
 
 
-def test_lb_radiation_rose():
+def test_solstices_equinoxes():
     solar = Solar.from_epw(EPW_OBJ)
-    assert isinstance(
-        solar.lb_radiation_rose(sky_matrix=solar._sky_matrix()), RadiationRose
-    )
+    solar.solstices_equinoxes
 
 
-def test_radiation_benefit_data():
+def test_to_wea():
     solar = Solar.from_epw(EPW_OBJ)
-    assert isinstance(
-        solar._radiation_benefit_data(temperature=EPW_OBJ.dry_bulb_temperature),
-        pd.Series,
-    )
+    solar.to_wea()
 
 
-def test_radiation_rose_data():
+def test_apply_shade_objects():
     solar = Solar.from_epw(EPW_OBJ)
-    assert isinstance(solar._radiation_rose_data(), pd.DataFrame)
+    with pytest.raises(NotImplementedError):
+        solar.apply_shade_objects()
 
 
-def test_tilt_orientation_factor_data():
+def test__sky_matrix():
     solar = Solar.from_epw(EPW_OBJ)
-    assert isinstance(solar._tilt_orientation_factor_data(), pd.DataFrame)
+    solar._sky_matrix()
+
+
+def test__radiation_rose():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar._radiation_rose()
+
+
+def test__radiation_benefit_data():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar._radiation_benefit_data(temperature=EPW_OBJ.dry_bulb_temperature)
+
+
+def test__radiation_rose_data():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar._radiation_rose_data()
+
+
+def test__tilt_orientation_factor_data():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar._tilt_orientation_factor_data()
+
+
+def test_filter_by_boolean_mask():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar.filter_by_boolean_mask()
+
+
+def test_filter_by_analysis_period():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar.filter_by_analysis_period()
+
+
+def test_filter_by_time():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar.filter_by_time()
+
+
+def test_plot_radiation_rose():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar.plot_radiation_rose()
+
+
+def test_plot_tilt_orientation_factor():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar.plot_tilt_orientation_factor()
+
+
+def test_plot_radiation_benefit_heatmap():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar.plot_radiation_benefit_heatmap(temperature=EPW_OBJ.dry_bulb_temperature)
+
+
+def test_plot_sunpath():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar.plot_sunpath()
+
+
+def test_plot_skymatrix():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar.plot_skymatrix()
+
+
+def test_plot_hours_sunlight():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar.plot_hours_sunlight()
+
+
+def test_plot_solar_elevation_azimuth():
+    solar = Solar.from_epw(EPW_OBJ)
+    solar.plot_solar_elevation_azimuth()

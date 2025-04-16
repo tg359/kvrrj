@@ -5,12 +5,11 @@
 # TODO - PV calc from pvlib
 # TODO - PV with shade objects (from sky matrix, or get total incident radiation on surface using Radiance and then feed into PVLib)
 # TODO - Use DirectSun/RadiationStudy to calculate shadedness of a point given context meshes
-# TODO - Add location to wind object
 # todo - glare risk for aperture in direction
-# todo - inherit from common base object for both wind and solar
 
 import json
-import urllib
+import subprocess
+import tempfile
 import warnings
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -18,13 +17,15 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Any
 
+import ephem
+import geopandas as gpd
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import pytz
-from honeybee.config import folders as hb_folders
-from honeybee.model import Model
 from ladybug.analysisperiod import AnalysisPeriod
 from ladybug.datacollection import HourlyContinuousCollection
+from ladybug.datatype.base import DataTypeBase
 from ladybug.datatype.energyintensity import (
     DiffuseHorizontalRadiation,
     DirectNormalRadiation,
@@ -33,59 +34,52 @@ from ladybug.datatype.energyintensity import (
 from ladybug.dt import Date, DateTime
 from ladybug.epw import EPW
 from ladybug.header import Header
-from ladybug.skymodel import dirint, disc
 from ladybug.sunpath import Location, Sun, Sunpath
+from ladybug.viewsphere import ViewSphere
 from ladybug.wea import Wea
 from ladybug_geometry.geometry3d import (
     Face3D,
     Mesh3D,
     Plane,
     Point3D,
+    Polyline3D,
 )
+
+# pylint: enable=E0401
+from ladybug_radiance.config import folders as lbr_folders
 from ladybug_radiance.skymatrix import SkyMatrix
 from ladybug_radiance.study.radiation import RadiationStudy
 from ladybug_radiance.visualize.raddome import RadiationDome
 from ladybug_radiance.visualize.radrose import RadiationRose
-from lbt_recipes.recipe import Recipe
-from matplotlib import pyplot as plt
 from matplotlib.axes import Axes
+from matplotlib.colors import BoundaryNorm, Colormap, ListedColormap
 from matplotlib.ticker import MultipleLocator
 from pvlib.irradiance import campbell_norman, get_extra_radiation
 from pvlib.location import Location as PVLocation
 
-from kvrrj.geometry.util import (
+from .geometry.to_shapely import to_shapely
+from .geometry.util import (
     _create_azimuth_mesh,
     angle_clockwise_from_north,
     vector3d_to_azimuth_altitude,
 )
-from kvrrj.honeybee_radiance import (
-    create_origin_sensor_grid,
-    geo_to_shade,
-    radiance_parameters,
-)
-from kvrrj.ladybug.analysisperiod import (
+from .ladybug.analysisperiod import (
     _analysis_period_to_string,
     _iterable_datetimes_to_lb_analysis_period,
 )
-from kvrrj.ladybug.location import (
-    _all_timezones_same,
-    _is_datetime_location_aligned,
+from .ladybug.location import (
     _is_location_time_zone_valid_for_location,
     average_location,
-    get_timezone_str_from_location,
     get_tzinfo_from_location,
-    get_utc_offset_from_location,
 )
-from kvrrj.logging import CONSOLE_LOGGER
-from kvrrj.util import (
+from .util import (
     _are_iterables_same_length,
     _datetimes_span_at_least_1_year,
     _filter_kwargs_by_allowable,
-    _is_iterable_1d,
     _is_iterable_single_dtype,
     _is_leap_year,
 )
-from kvrrj.viz.color import contrasting_color
+from .viz.color import contrasting_color
 
 
 class RadiationType(Enum):
@@ -95,27 +89,6 @@ class RadiationType(Enum):
     DIRECT = auto()
     DIFFUSE = auto()
     REFLECTED = auto()
-
-
-class SunriseSunsetType(Enum):
-    """An enumeration of different types of daylight."""
-
-    ACTUAL = auto()
-    APPARENT = auto()
-    CIVIL = auto()
-    NAUTICAL = auto()
-    ASTRONOMICAL = auto()
-
-    @property
-    def depression_angle(self) -> float:
-        """Get the depression angle (in degrees) for the daylight type."""
-        return {
-            SunriseSunsetType.ACTUAL.name: 0.5334,
-            SunriseSunsetType.APPARENT.name: 0.833,
-            SunriseSunsetType.CIVIL.name: 6,
-            SunriseSunsetType.NAUTICAL.name: 12,
-            SunriseSunsetType.ASTRONOMICAL.name: 18,
-        }[self.name]
 
 
 def _lb_location_to_pvlib_location(location: Location) -> PVLocation:
@@ -138,99 +111,142 @@ def _lb_location_to_pvlib_location(location: Location) -> PVLocation:
     )
 
 
-def _split_ghi_into_dni_dhi(
-    ghi: list[float],
-    datetimes: list[datetime],
-    location: Location,
-    pressures: list[float] | None = None,
-    use_disc: bool = False,
-) -> tuple:
-    """Split global horizontal irradiance into direct normal and diffuse horizontal.
+def sunrise_sunset(dates: list[date], location: Location) -> pd.DataFrame:
+    """Get sunrise and sunset times for the given dates in the given location.
 
     Args:
-        ghi (list[float]):
-            An iterable of global horizontal irradiance values, in Wh/m2.
-        datetimes (list[datetime]):
-            An iterable of datetime-like objects.
+        dates (list[date]):
+            A list of dates for which to get sunrise times.
         location (Location):
             A ladybug Location object.
-        pressures (list[float], optional):
-            An iterable of atmospheric pressures, in Pa. If None, a default value of 101325 Pa is used.
-        use_disc (bool, optional):
-            If True, use the disc method to calculate direct normal irradiance. If False, use the dirint method.
 
     Returns:
-        tuple:
-            A tuple of two lists: direct normal irradiance and diffuse horizontal irradiance.
-
+        pd.DataFrame:
+            A DataFrame with sunrise and sunset times for each date.
     """
 
-    # validation checks
-    if not _is_iterable_1d(ghi):
-        raise ValueError("ghi must be a list of floats.")
-    if not _is_iterable_single_dtype(ghi, (int, float, np.float64)):
-        raise ValueError("ghi must be a list of numeric values.")
+    # check inputs
+    if not all(isinstance(d, date) for d in dates):
+        raise ValueError("All items in dates must be date objects.")
     if not isinstance(location, Location):
-        raise ValueError("location must be a ladybug Location object.")
-    if not _is_iterable_1d(datetimes):
-        raise ValueError("datetimes must be a 1D iterable.")
-    if not _is_iterable_single_dtype(datetimes, datetime):
-        raise ValueError("datetimes must be a list of datetime-like objects.")
-    if len(ghi) != len(datetimes):
-        raise ValueError(
-            f"ghi must be the same length as datetimes. {len(ghi)} != {len(datetimes)}."
-        )
+        raise ValueError("Location must be a ladybug Location object.")
+    if not _is_iterable_single_dtype(dates, date):
+        raise ValueError("dates must be a 1D list of date objects.")
 
-    if pressures is not None:
-        if not _is_iterable_1d(pressures):
-            raise ValueError("pressures must be a 1D iterable.")
-        if not _is_iterable_single_dtype(pressures, (int, float, np.float64)):
-            raise ValueError("pressures must be a list of numeric values.")
-        if len(pressures) != len(datetimes):
-            raise ValueError(
-                f"pressures must be the same length as datetimes. {len(pressures)} != {len(datetimes)}."
-            )
-    else:
-        # create a list of pressures for each datetime
-        pressures = [101325] * len(datetimes)
-
-    # create sun altitudes for each dateitme for the given location
     sunpath = Sunpath.from_location(location)
-    sun_altitudes = [
-        sunpath.calculate_sun_from_date_time(dt).altitude for dt in datetimes
-    ]
 
-    # get the days of the year
-    doys = [dt.timetuple().tm_yday for dt in datetimes]
+    light_types = ["actual", "apparent", "civil", "nautical", "astronomical"]
+    depression_angles = [0.5334, 0.833, 6, 12, 18]
 
-    # calculate the direct normal irradiance (dni)
-    if use_disc:
-        dni, _, _ = np.array(
-            [
-                disc(
-                    ghi=ghi[i],
-                    altitude=sun_altitudes[i],
-                    doy=doys[i],
-                    pressure=pressures[i],
-                )
-                for i in range(len(datetimes))
-            ]
-        ).T.tolist()
+    # get solstice and equinox dates, to determine whether a date is considered winter or summer
+    years = np.unique([i.year for i in dates])
+    d = {}
+    for year in years:
+        d[year] = {
+            "vernal equinox": ephem.next_vernal_equinox(str(year)).datetime().date(),
+            "summer solstice": ephem.next_summer_solstice(str(year)).datetime().date(),
+            "autumnal equinox": ephem.next_autumnal_equinox(str(year))
+            .datetime()
+            .date(),
+            "winter solstice": ephem.next_winter_solstice(str(year)).datetime().date(),
+        }
+    se = pd.DataFrame(d).T
+
+    if location.latitude > 0:
+        # northern hemisphere
+        winter_dates = (dates > se["autumnal equinox"].values[0]) | (
+            dates < se["vernal equinox"].values[0]
+        )
     else:
-        dni = dirint(
-            ghi=ghi,
-            altitudes=sun_altitudes,
-            doys=doys,
-            pressures=pressures,
+        # southern hemisphere
+        winter_dates = (dates > se["vernal equinox"].values[0]) | (
+            dates < se["autumnal equinox"].values[0]
         )
 
-    # get dhi
-    dhi = [
-        ghi[i] - (dni[i] * np.sin(np.deg2rad(sun_altitudes[i])))
-        for i in range(len(ghi))
-    ]
+    # calculate sunrsies and sets
+    kk = {}
+    for is_winter, dt in zip(*[winter_dates, dates]):
+        day_start = pd.to_datetime(dt).to_pydatetime()
+        day_end = (pd.to_datetime(dt) + timedelta(days=1)).to_pydatetime()
+        rr = []
+        for light_type, depression in zip(*[light_types, depression_angles]):
+            # calculate sunrise and set times using ladybug
+            d = sunpath.calculate_sunrise_sunset(
+                month=dt.month, day=dt.day, depression=depression
+            )
 
-    return dni, dhi
+            # calculate the length (for the given light period) of the day in hours
+            length_key = "delta"
+            if d["sunrise"] is None and d["sunset"] is None and is_winter:
+                # no sunrise or sunset, and during winter
+                d[length_key] = 0
+            elif d["sunrise"] is None and d["sunset"] is None and not is_winter:
+                # no sunrise or sunset, and during summer
+                d[length_key] = 24
+            elif d["sunrise"] is None:
+                # only sunrise is present
+                d[length_key] = (day_end - d["sunrise"]).total_seconds() / 3600
+            elif d["sunset"] is None:
+                d[length_key] = (d["sunset"] - day_start).total_seconds() / 3600
+            else:
+                d[length_key] = (d["sunset"] - d["sunrise"]).total_seconds() / 3600
+
+            rr.append({(light_type, k): v for k, v in d.items()})
+
+            # rr.append({("night", "hours"): 24 - d["hours"]})
+        kk[pd.to_datetime(dt)] = {k: v for x in rr for k, v in x.items()}
+
+    df = pd.DataFrame(kk).T
+    df.index = pd.to_datetime(df.index)
+
+    # add the number of hours in each light period
+    actual_hours = (df[("actual", length_key)]).rename(("actual", "hours"))
+    apparent_hours = (df[("apparent", length_key)] - actual_hours).rename(
+        ("apparent", "hours")
+    )
+    civil_hours = (df[("civil", length_key)] - apparent_hours - actual_hours).rename(
+        ("civil", "hours")
+    )
+    nautical_hours = (
+        df[("nautical", length_key)] - civil_hours - apparent_hours - actual_hours
+    ).rename(("nautical", "hours"))
+    astronomical_hours = (
+        df[("astronomical", length_key)]
+        - nautical_hours
+        - civil_hours
+        - apparent_hours
+        - actual_hours
+    ).rename(("astronomical", "hours"))
+    night_hours = (
+        24
+        - (
+            actual_hours
+            + apparent_hours
+            + civil_hours
+            + nautical_hours
+            + astronomical_hours
+        )
+    ).rename(("night", "hours"))
+
+    df = pd.concat(
+        [
+            df,
+            pd.concat(
+                [
+                    actual_hours,
+                    apparent_hours,
+                    civil_hours,
+                    nautical_hours,
+                    astronomical_hours,
+                    night_hours,
+                ],
+                axis=1,
+            ),
+        ],
+        axis=1,
+    ).sort_index(axis=1)
+
+    return df
 
 
 @dataclass
@@ -257,9 +273,9 @@ class Solar:
 
     location: Location
     datetimes: list[datetime]
+    global_horizontal_radiation: list[float]
     direct_normal_radiation: list[float]
     diffuse_horizontal_radiation: list[float]
-    global_horizontal_radiation: list[float]
 
     # region: DUNDER METHODS
 
@@ -271,41 +287,34 @@ class Solar:
             raise ValueError("location must be a ladybug Location object.")
         if self.location.source is None:
             warnings.warn(
-                'The source field of the Location input is None. This means that things are a bit ambiguous! A default value of "somewhere ... be more spceific!" has been added.'
+                "The source field of the Location input is None. This means that things are a bit ambiguous!"
             )
-            self.location.source = "UnknownSource"
         if not _is_location_time_zone_valid_for_location(self.location):
-            raise ValueError(
-                f"The time zone of the location ({self.location.time_zone}) does not match the time zone of the lat/lon ({self.location.latitude}, {self.location.longitude})."
+            warnings.warn(
+                f"The time zone of the location ({self.location.time_zone}) does not match the expected time zone for the lat/lon ({self.location.latitude}, {self.location.longitude})."
             )
 
         # datetimes validation
-        if not _is_iterable_1d(self.datetimes):
-            raise ValueError("datetimes must be a 1D iterable.")
         if not _is_iterable_single_dtype(self.datetimes, datetime):
-            raise ValueError("datetimes must be a list of datetime-like objects.")
+            raise ValueError("datetimes must be a 1D list of datetime-like objects.")
 
-        # check datetime timezone awareness
-        location_tzinfo = get_tzinfo_from_location(self.location)
-        dts = []
-        for dt in self.datetimes:
-            if dt.tzinfo is None:
-                warnings.warn(
-                    "Timezone information is missing from datetimes. This will be obtained from the Location and added as a UTC offset to the datetimes."
-                )
-                dts.append(dt.replace(tzinfo=location_tzinfo))
-            else:
-                if not _is_datetime_location_aligned(dt, self.location):
-                    raise ValueError(
-                        "The datetimes' timezone must match the location's time_zone."
-                    )
-                dts.append(dt)
-        # check timezines are the same
-        if not _all_timezones_same([d.tzinfo for d in dts]):
-            raise ValueError(
-                "All datetimes must have the same timezone. This is not the case."
+        # timezone validation
+        tzi = get_tzinfo_from_location(self.location)
+        if self.datetimes[0].tzinfo is None:
+            self.datetimes = (
+                pd.to_datetime(self.datetimes)
+                .tz_localize(tzi, ambiguous="NaT")
+                .to_pydatetime()
+                .tolist()
             )
-        self.datetimes = dts
+        target_utc_offset = tzi.utcoffset(self.datetimes[0]).seconds / 3600
+        actual_utc_offset = (
+            self.datetimes[0].tzinfo.utcoffset(self.datetimes[0]).seconds / 3600
+        )
+        if target_utc_offset != actual_utc_offset:
+            raise ValueError(
+                f"datetimes time zone does not match location time zone. Expected {target_utc_offset}, got {actual_utc_offset}."
+            )
 
         # irradiance validation
         array_names = [
@@ -314,26 +323,27 @@ class Solar:
             "global_horizontal_radiation",
         ]
         for name in array_names:
-            if len(getattr(self, name)) != len(self.datetimes):
+            _temp = getattr(self, name)
+            # length validation
+            if len(_temp) != len(self.datetimes):
                 raise ValueError(
-                    f"{name} must be the same length as datetimes. {len(getattr(self, name))} != {len(self.datetimes)}."
+                    f"{name} must be the same length as datetimes. {len(_temp)} != {len(self.datetimes)}."
                 )
-            if not _is_iterable_1d(getattr(self, name)):
-                raise ValueError(f"{name} must be a 1D iterable.")
-            if not _is_iterable_single_dtype(
-                getattr(self, name), (int, float, np.float64)
-            ):
+            # dtype validation
+            if not _is_iterable_single_dtype(_temp, (int, float)):
                 raise ValueError(f"{name} must be a list of numeric values.")
-            if any(np.isnan(getattr(self, name))):
+            # null validation
+            if any(np.isnan(_temp)):
                 raise ValueError(f"{name} cannot contain null values.")
-            if any([i < 0 for i in getattr(self, name)]):
+            # value limit validation
+            if any([i < 0 for i in _temp]):
                 raise ValueError(f"{name} must be >= 0")
 
     def __len__(self) -> int:
         return len(self.datetimes)
 
     def __str__(self) -> str:
-        return f"{self.__class__.__name__} data from {self.location.source} (n={len(self)})"
+        return f"{self.__class__.__name__} data from {self.location.source}"
 
     def __repr__(self) -> str:
         return str(self)
@@ -360,74 +370,41 @@ class Solar:
             and self.global_horizontal_radiation == other.global_horizontal_radiation
         )
 
-    # endregion: DUNDER METHODS
-
-    # region: STATIC METHODS
-
-    @staticmethod
-    def _sunrise_sunset(dates: list[date], location: Location) -> pd.DataFrame:
-        """Get sunrise and sunset times for the given dates in the given location.
-
-        Args:
-            dates (list[date]):
-                A list of dates for which to get sunrise times.
-            location (Location):
-                A ladybug Location object.
-
-        Returns:
-            pd.DataFrame:
-                A DataFrame with sunrise and sunset times for each date.
-        """
-
-        # check inputs
-        if not all(isinstance(d, date) for d in dates):
-            raise ValueError("All items in dates must be date objects.")
-        if not isinstance(location, Location):
-            raise ValueError("Location must be a ladybug Location object.")
-        if not _is_iterable_1d(dates):
-            raise ValueError("dates must be a 1D iterable.")
-        if not _is_iterable_single_dtype(dates, date):
-            raise ValueError("dates must be a list of date objects.")
-
-        loc = location.duplicate()
-        # set location timezone to 0
-        if loc.time_zone != 0:
-            warnings.warn(
-                'The location\'s time zone is not "0". This will be set to UTC for the calculation to give local sunrise/set time.'
+    def __iter__(self) -> iter:
+        return (
+            (
+                self.datetimes[i],
+                self.global_horizontal_radiation[i],
+                self.direct_normal_radiation[i],
+                self.diffuse_horizontal_radiation[i],
             )
-            loc.time_zone = 0
+            for i in range(len(self))
+        )
 
-        # get the sunpath
-        sunpath = Sunpath.from_location(loc)
+    def __getitem__(self, idx: int) -> dict[str, datetime | float]:
+        return {
+            "datetime": self.datetimes[idx],
+            "global_horizontal_radiation": self.global_horizontal_radiation[idx],
+            "direct_normal_radiation": self.direct_normal_radiation[idx],
+            "diffuse_horizontal_radiation": self.diffuse_horizontal_radiation[idx],
+        }
 
-        # get sunrise times
-        kk = {}
-        for dt in dates:
-            if dt.month == 2 and dt.day == 29:
-                # skip leap day
-                warnings.warn(
-                    "Leap day (February 29) is not supported ... for some reason. Blame sunpath.calculate_sunrise_sunset_from_datetime"
-                )
-                continue
-            kk[dt] = {}
-            for s_type in SunriseSunsetType:
-                d = sunpath.calculate_sunrise_sunset_from_datetime(
-                    datetime=datetime(dt.year, month=dt.month, day=dt.day),
-                    depression=s_type.depression_angle,
-                )
-                for tod in ["sunrise", "sunset"]:
-                    kk[dt][f"{s_type.name.lower()} {tod}"] = d[tod]
-            kk[dt]["noon"] = d["noon"]
+    def __copy__(self) -> "Solar":
+        return Solar(
+            location=self.location.duplicate(),
+            datetimes=self.datetimes,
+            direct_normal_radiation=self.direct_normal_radiation,
+            diffuse_horizontal_radiation=self.diffuse_horizontal_radiation,
+            global_horizontal_radiation=self.global_horizontal_radiation,
+        )
 
-        return pd.DataFrame(kk).T.sort_index()
-
-    # endregion: STATIC METHODS
+    # endregion: DUNDER METHODS
 
     # region: PROPERTIES
 
     @property
     def dates(self) -> list[date]:
-        return sorted(list(set([dt.date() for dt in self.datetimes])))
+        return [dt.date() for dt in self.datetimes]
 
     @property
     def start_date(self) -> date:
@@ -463,7 +440,7 @@ class Solar:
 
     @property
     def datetimeindex(self) -> pd.DatetimeIndex:
-        return pd.DatetimeIndex(self.datetimes)
+        return pd.DatetimeIndex(self.datetimes, freq="infer")
 
     @property
     def direct_normal_radiation_series(self) -> pd.Series:
@@ -571,14 +548,6 @@ class Solar:
         return _iterable_datetimes_to_lb_analysis_period(dts)
 
     @property
-    def wea(self) -> Wea:
-        return Wea(
-            location=self.location,
-            direct_normal_irradiance=self.direct_normal_radiation_collection,
-            diffuse_horizontal_irradiance=self.diffuse_horizontal_radiation_collection,
-        )
-
-    @property
     def sunpath(self) -> Sunpath:
         return Sunpath.from_location(self.location)
 
@@ -607,10 +576,37 @@ class Solar:
             pd.DataFrame:
                 A DataFrame with sunrise and sunset times for each date in the analysis period.
         """
-        return self._sunrise_sunset(
-            dates=self.dates,
+        return sunrise_sunset(
+            dates=np.unique(self.dates),
             location=self.location,
         )
+
+    @property
+    def solstices_equinoxes(self) -> pd.DataFrame:
+        """Get the solstices and equinoxes for this object.
+
+        Returns:
+            pd.DataFrame:
+                A DataFrame with solstices and equinoxes for each date in the analysis period.
+        """
+        years = np.unique([i.year for i in self.dates])
+        d = {}
+        for year in years:
+            d[year] = {
+                "vernal equinox": ephem.next_vernal_equinox(str(year))
+                .datetime()
+                .date(),
+                "summer solstice": ephem.next_summer_solstice(str(year))
+                .datetime()
+                .date(),
+                "autumnal equinox": ephem.next_autumnal_equinox(str(year))
+                .datetime()
+                .date(),
+                "winter solstice": ephem.next_winter_solstice(str(year))
+                .datetime()
+                .date(),
+            }
+        return pd.DataFrame(d).T
 
     # endregion: PROPERTIES
 
@@ -620,8 +616,8 @@ class Solar:
         if not isinstance(wea, Wea):
             raise ValueError("wea must be a ladybug Wea object.")
 
-        location = wea.location.duplicate()
         # modify location to state the Wea object in the source field
+        location = wea.location.duplicate()
         location.source = "WEA"
 
         # obtain the datetimes
@@ -718,155 +714,6 @@ class Solar:
             direct_normal_radiation=irrads["dni"].tolist(),
             diffuse_horizontal_radiation=irrads["dhi"].tolist(),
             global_horizontal_radiation=irrads["ghi"].tolist(),
-        )
-
-    @classmethod
-    def from_openmeteo(
-        cls,
-        location: Location,
-        start_date: str | date,
-        end_date: str | date,
-    ) -> "Solar":
-        """Query Open Meteo for solar data."""
-
-        warnings.warn(
-            "Radiation data queried from OpenMeteo uses the global horizontal irradiance split into the direct and diffuse components. This can result in peak radiation times and directions not matching corresponding epw files. Caution should be used when constructing solar objects using this method"
-        )
-        if not isinstance(location, Location):
-            raise ValueError("location must be a ladybug Location object.")
-        if isinstance(start_date, str):
-            start_date = pd.to_datetime(start_date).to_pydatetime().date()
-        if isinstance(end_date, str):
-            end_date = pd.to_datetime(end_date).to_pydatetime().date()
-        if not isinstance(start_date, date):
-            raise ValueError("start_date must be a date object.")
-        if not isinstance(end_date, date):
-            raise ValueError("end_date must be a date object.")
-        if start_date > end_date:
-            raise ValueError("start_date must be less than end_date.")
-
-        # create the list of datetimes being queried
-        dates = [
-            i.date()
-            for i in pd.date_range(
-                start=start_date, end=end_date, freq="D", inclusive="both"
-            )
-        ]
-        _datetimes = pd.date_range(
-            start=start_date,
-            end=end_date + timedelta(days=1),
-            freq="h",
-            inclusive="both",
-        )[:-1]
-        if not _datetimes_span_at_least_1_year(_datetimes):
-            raise ValueError("The dates must span an entire year.")
-        if start_date.year == end_date.year:
-            # single year covered
-            if _is_leap_year(start_date.year):
-                # leap year
-                if len(dates) < 366:
-                    raise ValueError(
-                        "The requested date range must be at least a full year."
-                    )
-            else:
-                # non-leap year
-                if len(dates) < 365:
-                    raise ValueError(
-                        "The requested date range must be at least a full year."
-                    )
-
-        # get time zone from the location and check that it matches the location
-        time_zone_str = get_timezone_str_from_location(location)
-        time_zone_hours = get_utc_offset_from_location(location).seconds / 3600
-        if not _is_location_time_zone_valid_for_location(location):
-            raise ValueError(
-                f"The time zone of the location ({location.time_zone}) does not match the time zone of the lat/lon ({time_zone_hours})."
-            )
-
-        # modify the location so that its source is OpenMeteo ERA5
-        location = location.duplicate()
-        location.source = (
-            f"OpenMeteo ERA5 at {location.latitude}°, {location.longitude}°"
-        )
-
-        # set the output directory
-        _dir = Path(hb_folders.default_simulation_folder) / "_lbt_tk_openmeteo"
-        _dir.mkdir(exist_ok=True, parents=True)
-
-        # variables to query
-        vars = [
-            {
-                "openmeteo_name": "shortwave_radiation",
-                "openmeteo_unit": "W/m²",
-                "target_name": "Global Horizontal Radiation",
-                "target_unit": "Wh/m2",
-                "target_multiplier": 1,
-            },
-            {
-                "openmeteo_name": "surface_pressure",
-                "openmeteo_unit": "hPa",
-                "target_name": "Atmospheric Station Pressure",
-                "target_unit": "Pa",
-                "target_multiplier": 100,
-            },
-        ]
-
-        # create the savepath for the returned data
-        sp = (
-            _dir
-            / f"solar_{location.latitude}_{location.longitude}_{start_date:%Y%m%d}_{end_date:%Y%m%d}.json"
-        )
-        if sp.exists():
-            CONSOLE_LOGGER.info(f"Loading data from {sp.name}")
-            with open(sp, "r") as f:
-                data = json.load(f)
-        else:
-            # construct url query string
-            var_strings = ",".join([i["openmeteo_name"] for i in vars])
-            query_string = "".join(
-                [
-                    "https://archive-api.open-meteo.com/v1/era5",
-                    f"?latitude={location.latitude}",
-                    f"&longitude={location.longitude}",
-                    f"&timezone={time_zone_str}",
-                    f"&start_date={start_date:%Y-%m-%d}",
-                    f"&end_date={end_date:%Y-%m-%d}",
-                    f"&hourly={var_strings}",
-                ]
-            )
-
-            # query the data, and save to file
-            CONSOLE_LOGGER.info(f"Querying data from {query_string}")
-            with urllib.request.urlopen(query_string) as url:
-                data = json.load(url)
-            with open(sp, "w") as f:
-                json.dump(data, f)
-
-        # get the datetimes
-        datetimes: list[datetime] = (
-            pd.to_datetime(data["hourly"]["time"])
-            .tz_localize(pytz.FixedOffset(data["utc_offset_seconds"] / 60))
-            .to_pydatetime()
-            .tolist()
-        )
-        # get the global horizontal radiation
-        ghi = data["hourly"]["shortwave_radiation"]
-        # get the pressures
-        pressures = [i * 100 for i in data["hourly"]["surface_pressure"]]
-        # Split global rad into direct + diffuse using dirint method (aka. Perez split)
-        dni, dhi = _split_ghi_into_dni_dhi(
-            ghi=ghi,
-            datetimes=datetimes,
-            location=location,
-            pressures=pressures,
-            use_disc=False,
-        )
-        return cls(
-            location=location,
-            datetimes=datetimes,
-            direct_normal_radiation=dni,
-            diffuse_horizontal_radiation=dhi,
-            global_horizontal_radiation=ghi,
         )
 
     @classmethod
@@ -969,8 +816,12 @@ class Solar:
         if direct_normal_radiation_column is None:
             for col in [
                 "direct_normal_radiation",
+                "direct_normal_irradiance",
+                "dnr",
+                "dni",
                 "direct",
                 "Direct Normal Radiation (Wh/m2)",
+                "Direct Normal Irradiance (W/m2)",
             ]:
                 if col in df.columns:
                     direct_normal_radiation_column = col
@@ -981,9 +832,13 @@ class Solar:
                 )
         if diffuse_horizontal_radiation_column is None:
             for col in [
-                "diffuse_horizontal_radiation_column",
+                "diffuse_horizontal_radiation",
+                "diffuse_horizontal_irradiance",
+                "dhr",
+                "dhi",
                 "diffuse",
                 "Diffuse Horizontal Radiation (Wh/m2)",
+                "Diffuse Horizontal Irradiance (W/m2)",
             ]:
                 if col in df.columns:
                     diffuse_horizontal_radiation_column = col
@@ -994,9 +849,13 @@ class Solar:
                 )
         if global_horizontal_radiation_column is None:
             for col in [
-                "global_horizontal_radiation_column",
+                "global_horizontal_radiation",
+                "global_horizontal_irradiance",
+                "ghr",
+                "ghi",
                 "global",
                 "Global Horizontal Radiation (Wh/m2)",
+                "Global Horizontal Irradiance (W/m2)",
             ]:
                 if col in df.columns:
                     global_horizontal_radiation_column = col
@@ -1020,13 +879,9 @@ class Solar:
     def from_average(
         cls, objects: list["Solar"], weights: list[int | float] | None = None
     ) -> "Solar":
-        # check objects is a list of Solar objects
-
         # validation
-        if not _is_iterable_1d(objects):
-            raise ValueError("objects must be a 1D list of Solar objects.")
         if not _is_iterable_single_dtype(objects, Solar):
-            raise ValueError("objects must be a list of Solar objects.")
+            raise ValueError("objects must be a 1D list of Solar objects.")
         if len(objects) == 0:
             raise ValueError("objects cannot be empty.")
         if len(objects) == 1:
@@ -1064,6 +919,17 @@ class Solar:
 
     # region: INSTANCE METHODS
 
+    def to_wea(self, timestep: int = 1) -> Wea:
+        return Wea(
+            location=self.location,
+            direct_normal_irradiance=self.direct_normal_radiation_collection.interpolate_to_timestep(
+                timestep=timestep
+            ),
+            diffuse_horizontal_irradiance=self.diffuse_horizontal_radiation_collection.interpolate_to_timestep(
+                timestep=timestep
+            ),
+        )
+
     def apply_shade_objects(
         self,
         shade_objects: list[Any] = (),
@@ -1079,45 +945,17 @@ class Solar:
             Solar:
                 A new Solar object with the shading applied.
         """
-        raise NotImplementedError()
-        if len(shade_objects) == 0:
-            return self
-
-        # create shade objects from the passed shade_objects
-        shades = []
-        for shd in shade_objects:
-            shades.extend(geo_to_shade(shd))
-        # construct the model
-        model = Model(identifier="solar", orphaned_shades=shades)
-        # add sensor grid (single sensor at ground point uopwards)
-        model.properties.radiance.sensor_grids = [
-            create_origin_sensor_grid(identifier="xyz")
-        ]
-        # simulate annual irradiance
-        recipe = Recipe("annual-irradiance")
-        params = radiance_parameters(
-            model=model,
-            detail_dim=1,
-            recipe_type="annual",
-            detail_level=0,
-        )
-
-        recipe.input_value_by_name("model", model)
-        recipe.input_value_by_name("wea", self.wea)
-        recipe.input_value_by_name("output-type", "solar")
-        recipe.input_value_by_name("radiance-parameters", params)
-        results_folder = recipe.run()
-
-        return results_folder
+        # TODO - implement this method to calculate the impact of shades at varying locations surrounding the "sensor"
+        raise NotImplementedError("Hourly shade impact not yet implemented.")
 
     def _sky_matrix(
         self,
         north: int = 0,
-        high_density: bool = True,
         ground_reflectance: float = 0.2,
         temperature: HourlyContinuousCollection = None,
         balance_temperature: float = 15,
         balance_offset: float = 2,
+        timestep: int = 1,
     ) -> SkyMatrix:
         """Create a ladybug sky matrix from the solar data.
 
@@ -1125,9 +963,6 @@ class Solar:
             north (int, optional):
                 The north direction in degrees.
                 Default is 0.
-            high_density (bool, optional):
-                If True, the sky matrix will be created with high density.
-                Default is True.
             ground_reflectance (float, optional):
                 The ground reflectance value.
                 Default is 0.2.
@@ -1146,6 +981,9 @@ class Solar:
                 The temperature offset from the balance temperature
                 in Celsius where radiation is neither harmful nor helpful.
                 Default is 2.
+            timestep (int, optional):
+                The timestep (per hour) in minutes for the sky matrix.
+                Default is 1.
 
         Returns:
             SkyMatrix:
@@ -1153,26 +991,34 @@ class Solar:
         """
         if temperature is None:
             return SkyMatrix(
-                wea=self.wea,
+                wea=self.to_wea(timestep=timestep),
                 north=north,
-                high_density=high_density,
+                high_density=True,
                 ground_reflectance=ground_reflectance,
             )
 
         # check that temperature is a valid type
+        dni = self.direct_normal_radiation_collection.interpolate_to_timestep(
+            timestep=timestep
+        )
+        dhi = self.diffuse_horizontal_radiation_collection.interpolate_to_timestep(
+            timestep=timestep
+        )
         if not isinstance(temperature, HourlyContinuousCollection):
             raise ValueError(
                 "temperature must be a ladybug HourlyContinuousCollection object."
             )
         if not _are_iterables_same_length(self, temperature):
-            raise ValueError("temperature must be the same length as the solar data.")
+            raise ValueError(
+                f"temperature must be the same length as the solar data (n={len(self)})."
+            )
 
         return SkyMatrix.from_components_benefit(
             location=self.location,
-            direct_normal_irradiance=self.direct_normal_radiation_collection,
-            diffuse_horizontal_irradiance=self.diffuse_horizontal_radiation_collection,
+            direct_normal_irradiance=dni,
+            diffuse_horizontal_irradiance=dhi,
             north=north,
-            high_density=high_density,
+            high_density=True,
             ground_reflectance=ground_reflectance,
             temperature=temperature,
             balance_temperature=balance_temperature,
@@ -1181,7 +1027,7 @@ class Solar:
 
     def _radiation_rose(
         self,
-        sky_matrix: SkyMatrix,
+        sky_matrix: SkyMatrix = None,
         intersection_matrix: Any | None = None,
         direction_count: int = 36,
         tilt_angle: int = 0,
@@ -1189,9 +1035,10 @@ class Solar:
         """Convert this object to a ladybug RadiationRose object.
 
         Args:
-            sky_matrix (SkyMatrix):
+            sky_matrix (SkyMatrix, optional):
                 A SkyMatrix object, which describes the radiation coming
                 from the various patches of the sky.
+                Default is None, which uses the default sky matrix from the solar data.
             intersection_matrix (Any | None, optional):
                 An optional lists of lists, which can be used to account
                 for context shade surrounding the radiation rose. The matrix
@@ -1222,6 +1069,9 @@ class Solar:
                 A ladybug RadiationRose object.
         """
 
+        if sky_matrix is None:
+            sky_matrix = self._sky_matrix()
+
         return RadiationRose(
             sky_matrix=sky_matrix,
             intersection_matrix=intersection_matrix,
@@ -1233,7 +1083,6 @@ class Solar:
         self,
         temperature: HourlyContinuousCollection,
         north: int = 0,
-        high_density: bool = True,
         ground_reflectance: float = 0.2,
         balance_temperature: float = 15,
         balance_offset: float = 2,
@@ -1246,7 +1095,6 @@ class Solar:
         # create the sky matrix
         smx = self._sky_matrix(
             north=north,
-            high_density=high_density,
             ground_reflectance=ground_reflectance,
             temperature=temperature,
             balance_temperature=balance_temperature,
@@ -1270,7 +1118,6 @@ class Solar:
         directions: int = 36,
         tilt_angle: float = 0,
         north: int = 0,
-        high_density: bool = True,
         ground_reflectance: float = 0.2,
         shade_objects: list[Any] = (),
     ) -> pd.DataFrame:
@@ -1278,8 +1125,6 @@ class Solar:
         tilt_angle, within the analysis_period and subject to shade_objects.
 
         Args:
-            irradiance_type (RadiationType, optional):
-                The type of irradiance to plot. Defaults to RadiationType.TOTAL.
             analysis_period (AnalysisPeriod, optional):
                 The analysis period over which radiation shall be summarised.
                 Defaults to AnalysisPeriod().
@@ -1292,9 +1137,6 @@ class Solar:
             north (int, optional):
                 The north direction in degrees.
                 Defaults to 0.
-            high_density (bool, optional):
-                If True, the sky matrix will be created with high density.
-                Defaults to True.
             ground_reflectance (float, optional):
                 The reflectance of the ground.
                 Defaults to 0.2.
@@ -1319,7 +1161,7 @@ class Solar:
             diffuse_horizontal_irradiance=self.diffuse_horizontal_radiation_collection,
             hoys=analysis_period.hoys,
             north=north,
-            high_density=high_density,
+            high_density=True,
             ground_reflectance=ground_reflectance,
         )
 
@@ -1403,6 +1245,11 @@ class Solar:
             pd.DataFrame:
                 A pandas DataFrame containing the tilt-orientation-factor data.
         """
+        # check that a full years worth of hourly data is available
+        if not _datetimes_span_at_least_1_year(self.datetimes):
+            raise ValueError(
+                "The Solar object must contain at least 1 year of hourly or sub hourly data."
+            )
         # warn if azimuth count is less than 12
         if azimuth_count < 12:
             warnings.warn(
@@ -1504,13 +1351,15 @@ class Solar:
         )
         return df
 
-    # region: FILTERING
+    # endregion: INSTANCE METHODS
 
-    def filter_by_boolean_mask(self, mask: tuple[bool]) -> "Solar":
+    # region: FILTERING METHODS
+
+    def filter_by_boolean_mask(self, mask: list[bool] = None) -> "Solar":
         """Filter the current object by a boolean mask.
 
         Args:
-            mask (tuple[bool]):
+            mask (list[bool]):
                 A boolean mask to filter the current object.
 
         Returns:
@@ -1518,14 +1367,18 @@ class Solar:
                 A dataset describing solar radiation.
         """
 
+        if mask is None:
+            mask = [True] * len(self)
+
+        # validations
+        if not _is_iterable_single_dtype(mask, bool):
+            raise ValueError("mask must be a list of booleans.")
         if len(mask) != len(self):
             raise ValueError(
                 "The length of the boolean mask must match the length of the current object."
             )
-
         if sum(mask) == 0:
             raise ValueError("No data remains within the given boolean filters.")
-
         if sum(mask) == len(self):
             return self
 
@@ -1560,54 +1413,41 @@ class Solar:
             Solar:
                 A dataset describing solar radiation.
         """
+        mask = []
+        for n, i in enumerate(self.lb_datetimes):
+            mask.append(i in analysis_period.datetimes)
 
-        possible_datetimes = pd.to_datetime(analysis_period.datetimes)
-        lookup = pd.DataFrame(
-            {
-                "month": possible_datetimes.month,
-                "day": possible_datetimes.day,
-                "time": possible_datetimes.time,
-            }
-        )
-        idx = self.datetimeindex
-        reference = pd.DataFrame(
-            {
-                "month": idx.month,
-                "day": idx.day,
-                "time": idx.time,
-            }
-        )
-        mask = reference.isin(lookup).all(axis=1)
-
+        # create new data
         loc = self.location.duplicate()
         loc.source = (
             f"{self.location.source} (filtered to {_analysis_period_to_string(analysis_period)})",
         )
+        datetimes = [i for i, j in zip(*[self.datetimes, mask]) if j]
+        dni = [i for i, j in zip(*[self.direct_normal_radiation, mask]) if j]
+        dhi = [i for i, j in zip(*[self.diffuse_horizontal_radiation, mask]) if j]
+        ghi = [i for i, j in zip(*[self.global_horizontal_radiation, mask]) if j]
 
         return Solar(
             location=loc,
-            datetimes=[i for i, j in zip(*[self.datetimes, mask]) if j],
-            direct_normal_radiation=[
-                i for i, j in zip(*[self.direct_normal_radiation, mask]) if j
-            ],
-            diffuse_horizontal_radiation=[
-                i for i, j in zip(*[self.diffuse_horizontal_radiation, mask]) if j
-            ],
-            global_horizontal_radiation=[
-                i for i, j in zip(*[self.global_horizontal_radiation, mask]) if j
-            ],
+            datetimes=datetimes,
+            direct_normal_radiation=dni,
+            diffuse_horizontal_radiation=dhi,
+            global_horizontal_radiation=ghi,
         )
 
     def filter_by_time(
         self,
-        months: tuple[float] = None,
-        days: tuple[float] = None,
-        hours: tuple[int] = None,
-        years: tuple[int] = None,
-    ) -> "Wind":
-        """Filter the current object by month and hour.
+        years: list[int] = None,
+        months: list[float] = None,
+        days: list[float] = None,
+        hours: list[int] = None,
+    ) -> "Solar":
+        """Filter the current object by months, days, hours.
 
         Args:
+            years (list[int], optional):
+                A list of years to include.
+                Default to all years.
             months (list[int], optional):
                 A list of months.
                 Defaults to all possible months.
@@ -1617,159 +1457,72 @@ class Solar:
             hours (list[int], optional):
                 A list of hours.
                 Defaults to all possible hours.
-            years (tuple[int], optional):
-                A list of years to include.
-                Default to all years.
 
         Returns:
-            Wind:
-                A dataset describing historic wind speed and direction relationship.
+            Solar:
+                A dataset describing historic solar data.
         """
-
+        idx = self.datetimeindex
+        filtered_by = []
+        if years is None:
+            years = idx.year.unique().tolist()
+        else:
+            filtered_by.append("year")
         if months is None:
-            months = range(1, 13)
+            months = list(range(1, 13))
+        else:
+            filtered_by.append("month")
         if days is None:
-            days = range(1, 32)
+            days = list(range(1, 32))
+        else:
+            filtered_by.append("day")
         if hours is None:
-            hours = range(0, 24)
+            hours = list(range(0, 24))
+        else:
+            filtered_by.append("hour")
 
-        # convert the datetimes to a pandas datetime index
-        idx = pd.DatetimeIndex(self.datetimes)
+        if len(filtered_by) > 2:
+            filtered_by = ", ".join(filtered_by[:-1]) + ", and " + str(filtered_by[-1])
+        elif len(filtered_by) == 2:
+            filtered_by = " and ".join(filtered_by)
+        elif len(filtered_by) == 1:
+            filtered_by = filtered_by[0]
 
-        # construct the masks
-        year_mask = (
-            np.ones_like(idx).astype(bool) if years is None else idx.year.isin(years)
-        )
+        # construct masks
+        year_mask = idx.year.isin(years)
         month_mask = idx.month.isin(months)
         day_mask = idx.day.isin(days)
         hour_mask = idx.hour.isin(hours)
         mask = np.all([year_mask, month_mask, day_mask, hour_mask], axis=0)
 
-        filtered_by = []
-        if sum(year_mask) != 0:
-            filtered_by.append("year")
-        if sum(month_mask) != 0:
-            filtered_by.append("month")
-        if sum(day_mask) != 0:
-            filtered_by.append("day")
-        if sum(hour_mask) != 0:
-            filtered_by.append("hour")
-        filtered_by = ", ".join(filtered_by)
-        source = f"{self.source} (filtered {filtered_by})"
+        # create new data
+        loc = self.location.duplicate()
+        loc.source = f"{self.location.source} (filtered by {filtered_by})"
+        datetimes = [i for i, j in zip(*[self.datetimes, mask]) if j]
+        dni = [i for i, j in zip(*[self.direct_normal_radiation, mask]) if j]
+        dhi = [i for i, j in zip(*[self.diffuse_horizontal_radiation, mask]) if j]
+        ghi = [i for i, j in zip(*[self.global_horizontal_radiation, mask]) if j]
 
-        return self.filter_by_boolean_mask(
-            mask,
-            source=source,
+        return Solar(
+            location=loc,
+            datetimes=datetimes,
+            direct_normal_radiation=dni,
+            diffuse_horizontal_radiation=dhi,
+            global_horizontal_radiation=ghi,
         )
 
-    def filter_by_direction(
-        self,
-        left_angle: float = 0,
-        right_angle: float = 360,
-        right: bool = True,
-    ) -> "Wind":
-        """Filter the current object by wind direction, based on the angle as
-        observed from a location.
-
-        Args:
-            left_angle (float):
-                The left-most angle, to the left of which wind speeds and
-                directions will be removed.
-                Defaults to 0.
-            right_angle (float):
-                The right-most angle, to the right of which wind speeds and
-                directions will be removed.
-                Defaults to 360.
-            right (bool, optional):
-                Indicates whether the interval includes the rightmost edge or not.
-                Defaults to True.
-
-        Return:
-            Wind:
-                A Wind object!
-        """
-
-        if left_angle < 0 or right_angle > 360:
-            raise ValueError("Angle limits must be between 0 and 360 degrees.")
-
-        if left_angle == 0 and right_angle == 360:
-            return self
-
-        if (left_angle == right_angle) or (left_angle == 360 and right_angle == 0):
-            raise ValueError("Angle limits cannot be identical.")
-
-        wd = self.wd.values
-
-        if left_angle > right_angle:
-            if right:
-                mask = (wd > left_angle) | (wd <= right_angle)
-            else:
-                mask = (wd >= left_angle) | (wd < right_angle)
-        else:
-            if right:
-                mask = (wd > left_angle) & (wd <= right_angle)
-            else:
-                mask = (self.wd >= left_angle) & (self.wd < right_angle)
-
-        source = f"{self.source} (filtered by direction {'(' if right else '['}{left_angle}-{right_angle}{']' if right else ')'})"
-
-        return self.filter_by_boolean_mask(mask, source=source)
-
-    def filter_by_speed(
-        self, min_speed: float = 0, max_speed: float = np.inf, right: bool = True
-    ) -> "Wind":
-        """Filter the current object by wind speed, based on given low-high limit values.
-
-        Args:
-            min_speed (float):
-                The lowest speed to include. Values below this wil be removed.
-                Defaults to 0.
-            max_speed (float):
-                The highest speed to include. Values above this wil be removed.
-                Defaults to np.inf.
-            right (bool, optional):
-                Include values that are exactly the min or max speeds.
-                Defaults to True.
-
-        Return:
-            Wind:
-                A Wind object!
-        """
-
-        if min_speed < 0:
-            raise ValueError("min_speed cannot be negative.")
-
-        if max_speed <= min_speed:
-            raise ValueError("min_speed must be less than max_speed.")
-
-        if min_speed == 0 and np.isinf(max_speed):
-            return self
-
-        if right:
-            mask = (self.ws > min_speed) & (self.ws <= max_speed)
-        else:
-            mask = (self.ws >= min_speed) & (self.ws < max_speed)
-
-        # get the new min/max speeds for labelling the source max
-        source = f"{self.source} (filtered by speed {min_speed}m/s-{min(self.ws[mask].max(), max_speed)}m/s)"
-
-        return self.filter_by_boolean_mask(mask, source=source)
-
-    # endregion: FILTERING
-
-    # endregion: INSTANCE METHODS
+    # endregion: FILTERING METHODS
 
     # region: PLOTTING METHODS
 
     def plot_radiation_rose(
         self,
         ax: Axes | None = None,
-        irradiance_type: RadiationType = RadiationType.TOTAL,
+        radiation_type: RadiationType = RadiationType.TOTAL,
         analysis_period: AnalysisPeriod = AnalysisPeriod(),
         directions: int = 36,
         tilt_angle: float = 0,
         north: int = 0,
-        high_density: bool = True,
         ground_reflectance: float = 0.2,
         shade_objects: list[Any] = (),
         **kwargs,
@@ -1779,7 +1532,7 @@ class Solar:
         Args:
             ax (Axes, optional):
                 The matplotlib Axes to plot the radiation rose on.
-            irradiance_type (RadiationType, optional):
+            radiation_type (RadiationType, optional):
                 The type of irradiance to plot. Defaults to RadiationType.TOTAL.
             analysis_period (AnalysisPeriod, optional):
                 The analysis period over which radiation shall be summarised.
@@ -1793,9 +1546,6 @@ class Solar:
             north (int, optional):
                 The north direction in degrees.
                 Defaults to 0.
-            high_density (bool, optional):
-                If True, the sky matrix will be created with high density.
-                Defaults to True.
             ground_reflectance (float, optional):
                 The reflectance of the ground.
                 Defaults to 0.2.
@@ -1804,7 +1554,7 @@ class Solar:
                 Defaults to an empty list.
         """
 
-        if irradiance_type == RadiationType.REFLECTED:
+        if radiation_type == RadiationType.REFLECTED:
             raise ValueError(
                 "The REFLECTED irradiance type is not supported for plotting a radiation rose."
             )
@@ -1815,13 +1565,12 @@ class Solar:
             directions=directions,
             tilt_angle=tilt_angle,
             north=north,
-            high_density=high_density,
             ground_reflectance=ground_reflectance,
             shade_objects=shade_objects,
         )
 
         # get the radiation data
-        match irradiance_type:
+        match radiation_type:
             case RadiationType.TOTAL:
                 data = rad_df[RadiationType.TOTAL.name]
             case RadiationType.DIRECT:
@@ -1933,7 +1682,7 @@ class Solar:
     def plot_tilt_orientation_factor(
         self,
         ax: Axes | None = None,
-        irradiance_type: RadiationType = RadiationType.TOTAL,
+        radiation_type: RadiationType = RadiationType.TOTAL,
         analysis_period: AnalysisPeriod = AnalysisPeriod(),
         azimuth_count: int = 36,
         altitude_count: int = 9,
@@ -1948,7 +1697,7 @@ class Solar:
         Args:
             ax (Axes, optional):
                 The matplotlib Axes to plot the tilt-orientation-factor diagram on.
-            irradiance_type (RadiationType, optional):
+            radiation_type (RadiationType, optional):
                 The type of irradiance to plot. Defaults to RadiationType.TOTAL.
             analysis_period (AnalysisPeriod, optional):
                 The analysis period over which radiation shall be summarised.
@@ -1978,7 +1727,7 @@ class Solar:
             ax: Axes:
                 The matplotlib Axes object containing the plot.
         """
-        if irradiance_type == RadiationType.REFLECTED:
+        if radiation_type == RadiationType.REFLECTED:
             raise ValueError(
                 "The REFLECTED irradiance type is not supported for plotting a tilt-orientation-factor diagram."
             )
@@ -1989,7 +1738,7 @@ class Solar:
             azimuth_count=azimuth_count,
             altitude_count=altitude_count,
             shade_objects=shade_objects,
-        )[["azimuth", "altitude", irradiance_type.name]].values.T
+        )[["azimuth", "altitude", radiation_type.name]].values.T
 
         # split kwargs by endpoint
         tricontourf_kwargs = _filter_kwargs_by_allowable(
@@ -2104,8 +1853,6 @@ class Solar:
         ax.set_xlabel("Orientation (clockwise from North at 0°)")
         ax.set_ylabel("Tilt (0° facing the horizon, 90° facing the sky)")
 
-        plt.tight_layout()
-
         return ax
 
     def plot_radiation_benefit_heatmap(
@@ -2113,7 +1860,6 @@ class Solar:
         temperature: HourlyContinuousCollection,
         ax: Axes = None,
         north: int = 0,
-        high_density: bool = True,
         ground_reflectance: float = 0.2,
         balance_temperature: float = 15,
         balance_offset: float = 2,
@@ -2142,7 +1888,6 @@ class Solar:
         data = self._radiation_benefit_data(
             temperature=temperature,
             north=north,
-            high_density=high_density,
             ground_reflectance=ground_reflectance,
             balance_temperature=balance_temperature,
             balance_offset=balance_offset,
@@ -2166,5 +1911,400 @@ class Solar:
         cb.outline.set_visible(False)
 
         return ax
+
+    def plot_sunpath(
+        self,
+        ax: plt.Axes = None,
+        other_data: list[float] = None,
+        other_datatype: DataTypeBase = None,
+        cmap: Colormap | str = "viridis",
+        norm: BoundaryNorm = None,
+        sun_size: float = 10,
+        show_grid: bool = True,
+        show_legend: bool = True,
+        **kwargs,
+    ) -> Axes:
+        """Plot a sun-path for the given Location and analysis period.
+        Args:
+            location (Location):
+                A ladybug Location object.
+            ax (plt.Axes, optional):
+                A matplotlib Axes object. Defaults to None.
+            analysis_period (AnalysisPeriod, optional):
+                _description_. Defaults to None.
+            data_collection (HourlyContinuousCollection, optional):
+                An aligned data collection. Defaults to None.
+            cmap (str, optional):
+                The colormap to apply to the aligned data_collection. Defaults to None.
+            norm (BoundaryNorm, optional):
+                A matplotlib BoundaryNorm object containing colormap boundary mapping information.
+                Defaults to None.
+            sun_size (float, optional):
+                The size of each sun in the plot. Defaults to 0.2.
+            show_grid (bool, optional):
+                Set to True to show the grid. Defaults to True.
+            show_legend (bool, optional):
+                Set to True to include a legend in the plot if data_collection passed. Defaults to True.
+        Returns:
+            plt.Axes:
+                A matplotlib Axes object.
+        """
+
+        if ax is None:
+            _, ax = plt.subplots(subplot_kw={"projection": "polar"})
+
+        title = kwargs.pop("title", self.location.source)
+
+        def to_spherical(point3d):
+            """
+            Convert a 3D point to spherical coordinates (r, theta, phi).
+            r is the distance from the origin to the point,
+            theta is the angle in the x-y plane from the x-axis, with y-north at 0 degrees,
+            and phi is the angle from the z-axis.
+            """
+            r = np.sqrt(point3d.x**2 + point3d.y**2 + point3d.z**2)
+            theta = np.arctan2(point3d.y, point3d.x)
+            phi = np.arccos(point3d.z / r)
+            # rotate theta -90 degrees to make 0 degrees north
+            theta = theta - np.pi / 2
+            return r, theta, phi
+
+        radius = 1
+
+        if other_data is not None:
+            raise NotImplementedError("other_data is not implemented yet")
+            # todo - implement colormap to other dat, and otehr data type (other_datatype: DataTypeBase = None)
+            if len(other_data) != len(self):
+                raise ValueError("other_data must be the same length")
+
+        sunpath: Sunpath = self.sunpath
+
+        # plot analemmae
+        analemma_polylines_3d = sunpath.hourly_analemma_polyline3d(
+            steps_per_month=2, radius=radius
+        ) + [
+            Polyline3D(i.subdivide_evenly(24))
+            for i in sunpath.monthly_day_arc3d(radius=radius)
+        ]
+        for polyline in analemma_polylines_3d:
+            _, theta, phi = np.array([to_spherical(i) for i in polyline]).T
+            ax.plot(theta, phi, linewidth=1, color="black", zorder=1)
+
+        # plot suns
+        suns = [sun for sun in self.suns if sun.altitude > 0]
+        _, theta, phi = np.array(
+            [to_spherical(i.position_3d(radius=1)) for i in suns]
+        ).T
+        ax.scatter(theta, phi, s=1, c="orange", zorder=1)
+
+        # format plot
+        ax.spines["polar"].set_visible(False)
+        ax.set_theta_zero_location("N")
+        ax.set_theta_direction(-1)
+
+        ax.set_title(title)
+
+        return ax
+
+    def plot_skymatrix(
+        self,
+        ax: Axes = None,
+        radiation_type: RadiationType = RadiationType.TOTAL,
+        density: int = 1,
+        analysis_period: AnalysisPeriod = AnalysisPeriod(),
+        **kwargs,
+    ) -> Axes:
+        # split kwargs by endpoint
+        plot_kwargs = _filter_kwargs_by_allowable(
+            kwargs,
+            [
+                "levels",
+                "alpha",
+                "cmap",
+                "norm",
+            ],
+        )
+
+        # create wea
+        wea = self.to_wea(timestep=analysis_period.timestep).filter_by_analysis_period(
+            analysis_period
+        )
+        wea_duration = len(wea) / wea.timestep
+        wea_folder = Path(tempfile.gettempdir())
+        wea_path = wea_folder / "skymatrix.wea"
+        wea_file = wea.write(wea_path.as_posix())
+
+        # run gendaymtx
+        gendaymtx_exe = (Path(lbr_folders.radbin_path) / "gendaymtx.exe").as_posix()
+        cmds = [gendaymtx_exe, "-m", str(density), "-d", "-O1", "-A", wea_file]
+        with subprocess.Popen(cmds, stdout=subprocess.PIPE, shell=True) as process:
+            stdout = process.communicate()
+        dir_data_str = stdout[0].decode("ascii")
+        cmds = [gendaymtx_exe, "-m", str(density), "-s", "-O1", "-A", wea_file]
+        with subprocess.Popen(cmds, stdout=subprocess.PIPE, shell=True) as process:
+            stdout = process.communicate()
+        diff_data_str = stdout[0].decode("ascii")
+
+        def _broadband_rad(data_str: str) -> list[float]:
+            _ = data_str.split("\r\n")[:8]
+            data = np.array(
+                [[float(j) for j in i.split()] for i in data_str.split("\r\n")[8:]][
+                    1:-1
+                ]
+            )
+            patch_values = (
+                np.array([0.265074126, 0.670114631, 0.064811243]) * data
+            ).sum(axis=1)
+            patch_steradians = np.array(ViewSphere().dome_patch_weights(density))
+            broadband_radiation = patch_values * patch_steradians * wea_duration / 1000
+            return broadband_radiation
+
+        dir_vals = _broadband_rad(dir_data_str)
+        diff_vals = _broadband_rad(diff_data_str)
+
+        # create the ,mesh to assign data to
+        msh = ViewSphere().dome_patches(density)[0]
+        # reshape the data to align with mesh faces
+        direct_values = np.concatenate(
+            [dir_vals[:-1], np.repeat(dir_vals[0], len(msh.faces) - len(dir_vals) + 1)]
+        )
+        diffuse_values = np.concatenate(
+            [
+                diff_vals[:-1],
+                np.repeat(diff_vals[0], len(msh.faces) - len(diff_vals) + 1),
+            ]
+        )
+        # create geodataframe with data-linked geometry
+        shps = to_shapely(msh)
+        df = pd.DataFrame(
+            data=[direct_values, diffuse_values, direct_values + diffuse_values],
+            index=[
+                RadiationType.DIRECT.name,
+                RadiationType.DIFFUSE.name,
+                RadiationType.TOTAL.name,
+            ],
+        ).T
+        gdf = gpd.GeoDataFrame(df, geometry=list(shps.geoms))
+
+        if ax is None:
+            ax = plt.gca()
+
+        # todo - additional plot formatting in here ...
+
+        return gdf.plot(ax=ax, column=radiation_type.name, **plot_kwargs)
+
+    def plot_hours_sunlight(self, ax: Axes = None) -> Axes:
+        ax = plt.gca()
+
+        df = self.sunrise_sunset
+        adf = df.filter(regex="hours")[
+            ["actual", "apparent", "astronomical", "civil", "nautical", "night"]
+        ].droplevel(1, axis=1)
+        solsices_equinoxes = self.solstices_equinoxes
+        renamer = {
+            "actual": "Daytime",
+            "apparent": "Apparent daytime",
+            "astronomical": "Astronomical twilight",
+            "civil": "Civil twilight",
+            "nautical": "Nautical twilight",
+            "night": "Night-time",
+        }
+        ax = plt.gca()
+        colors = ["#FCE49D", "#dbc892ff", "#B9AC86", "#908A7A", "#817F76", "#717171"]
+        base = np.zeros_like(adf.index, dtype=float)
+        for n, (col_name, col_values) in enumerate(adf.items()):
+            vals = np.array(col_values, dtype=float)
+            ax.fill_between(
+                x=adf.index,
+                y1=base,
+                y2=base + vals,
+                color=colors[n],
+                label=renamer[col_name],
+            )
+            base += vals
+
+        # add solstice and equinox lines
+        for col_name, col_values in solsices_equinoxes.items():
+            dt = col_values.values[0]
+            ax.axvline(x=dt, color="black", ls="--", alpha=0.5)
+            # add sunrise/set times for key dates too
+
+            try:
+                srise = pd.to_datetime(
+                    df[(df.index.month == dt.month) & (df.index.day == dt.day)][
+                        ("actual", "sunrise")
+                    ].values[0]
+                ).strftime("%H:%M")
+            except AttributeError:
+                srise = np.nan
+            try:
+                sset = pd.to_datetime(
+                    df[(df.index.month == dt.month) & (df.index.day == dt.day)][
+                        ("actual", "sunset")
+                    ].values[0]
+                ).strftime("%H:%M")
+            except AttributeError:
+                sset = np.nan
+            ax.text(
+                (dt + timedelta(days=1)) if dt.month < 6 else (dt - timedelta(days=1)),
+                23.75,
+                f"{col_name.title()}\n{dt.strftime('%d %b')}\nSunrise: {srise}\nSunset: {sset}",
+                rotation=0,
+                ha="left" if dt.month < 6 else "right",
+                va="top",
+                fontsize="small",
+                alpha=0.5,
+            )
+
+        ax.set_xlim(adf.index[0], adf.index[-1])
+        ax.set_ylim(0, 24)
+        ax.set_yticks(np.arange(0, 25, 3))
+        ax.set_title(f"Hours of daylight and twilight\n{self}")
+        ax.set_ylabel("Hours")
+        ax.legend(
+            bbox_to_anchor=(0.5, -0.05),
+            loc="upper center",
+            ncol=6,
+            title="Day period",
+        )
+        ax.grid(
+            which="both",
+            ls="--",
+            alpha=0.5,
+        )
+        return ax
+
+    def plot_solar_elevation_azimuth(self, ax: Axes = None) -> Axes:
+        """Plot the solar elevation and azimuth for a location.
+
+        Args:
+            ax (plt.Axes, optional):
+                A matploltib axes to plot on. Defaults to None.
+
+        Returns:
+            Axes:
+                The matplotlib axes.
+        """
+        # create suns
+        sp = self.sunpath
+        idx = pd.date_range("2017-01-01 00:00:00", "2018-01-01 00:00:00", freq="10min")
+        suns = [sp.calculate_sun_from_date_time(i) for i in idx]
+        a = pd.DataFrame(index=idx)
+        a["altitude"] = [i.altitude for i in suns]
+        a["azimuth"] = [i.azimuth for i in suns]
+
+        # create cmap
+        cmap = ListedColormap(
+            colors=(
+                "#809FB4",
+                "#90ACBE",
+                "#9FC7A2",
+                "#90BF94",
+                "#9FC7A2",
+                "#CF807A",
+                "#C86C65",
+                "#CF807A",
+                "#C6ACA0",
+                "#BD9F92",
+                "#C6ACA0",
+                "#90ACBE",
+                "#809FB4",
+            ),
+            name="noname",
+        )
+        cmap.set_over("#809FB4")
+        cmap.set_under("#809FB4")
+        norm = BoundaryNorm(
+            boundaries=[
+                0,
+                22.5,
+                45,
+                67.5,
+                112.5,
+                135,
+                157.5,
+                202.5,
+                225,
+                247.5,
+                292.5,
+                315,
+                337.5,
+                360,
+            ],
+            ncolors=cmap.N,
+        )
+
+        # create plot
+        if ax is None:
+            ax = plt.gca()
+
+        series = a["azimuth"]
+        day_time_matrix = (
+            series.dropna()
+            .to_frame()
+            .pivot_table(
+                columns=series.dropna().index.date, index=series.dropna().index.time
+            )
+        )
+        x = mdates.date2num(day_time_matrix.columns.get_level_values(1))
+        y = mdates.date2num(
+            pd.to_datetime([f"2017-01-01 {i}" for i in day_time_matrix.index])
+        )
+        z = day_time_matrix.values
+        pcm = ax.pcolormesh(
+            x,
+            y,
+            z[:-1, :-1],
+            cmap=cmap,
+            norm=norm,
+        )
+        ax.xaxis_date()
+        ax.xaxis.set_major_locator(mdates.MonthLocator())
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+
+        ax.yaxis_date()
+        ax.yaxis.set_major_locator(mdates.HourLocator(interval=3))
+        ax.yaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+
+        ax.tick_params(labelleft=True, labelbottom=True)
+
+        # hide all spines
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        for i in ax.get_xticks():
+            ax.axvline(i, color="w", ls=":", lw=0.5, alpha=0.5)
+        for i in ax.get_yticks():
+            ax.axhline(i, color="w", ls=":", lw=0.5, alpha=0.5)
+        cb = plt.colorbar(
+            pcm,
+            ax=ax,
+            orientation="horizontal",
+            drawedges=False,
+            fraction=0.05,
+            aspect=100,
+            pad=0.075,
+            # extend=extend,
+            label=series.name.title(),
+        )
+        cb.outline.set_visible(False)
+        cb.set_ticks(
+            [0, 45, 90, 135, 180, 225, 270, 315, 360],
+            labels=["N", "NE", "E", "SE", "S", "SW", "W", "NW", "N"],
+        )
+        ax.set_title(f"Sun Altitude and Azimuth\n{self}")
+        ylim = ax.get_ylim()
+
+        # create matrix of monthday/hour for pcolormesh
+        pvt = a.pivot_table(columns=a.index.date, index=a.index.time)
+
+        # plot the contours for sun positions
+        x = mdates.date2num(pvt["altitude"].columns)
+        y = mdates.date2num(pd.to_datetime([f"2017-01-01 {i}" for i in pvt.index]))
+        z = pvt["altitude"].values
+        # z = np.ma.masked_array(z, mask=z < 0)
+        ct = ax.contour(x, y, z, colors="k", levels=np.arange(0, 91, 10))
+        ax.clabel(ct, inline=1, fontsize="small")
+        ax.set_ylim(ylim)
 
     # endregion: PLOTTING METHODS
